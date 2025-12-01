@@ -1,0 +1,7 @@
+[target.aarch64-unknown-none]
+linker = "aarch64-none-elf-ld"
+rustflags = [
+  "-C", "link-args=-T./src/link.ld", "--cfg", "no_std", "-Ctarget-feature=-fp-armv8"
+]
+runner = "./run.sh"
+

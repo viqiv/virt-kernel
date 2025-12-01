@@ -1,0 +1,4 @@
+target remote localhost:1234
+display/i $pc
+break xyz::arch::w_sctlr_el1
+# c

@@ -5,8 +5,14 @@ qemu-system-aarch64 \
     -nographic \
     -d guest_errors \
     -monitor telnet:127.0.0.1:4444,server,nowait \
-    -kernel "$1"\
-    -S -s
+    -kernel "$1" \
+    -device virtio-rng-device \
+    -fsdev local,id=fs0,path=/home/m/Desktop/dbg,security_model=passthrough \
+    -device virtio-9p-device,fsdev=fs0,mount_tag=sh0 \
+    -drive file=/home/m/Desktop/raspi.img,if=none,id=hd0,format=raw \
+    -device virtio-blk-device,drive=hd0 \
+    -global virtio-mmio.force-legacy=false \
+    #-S -s
 
 
 # (qemu) info mtree

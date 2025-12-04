@@ -2,7 +2,7 @@ use crate::{
     arch::{self, tlbi_vaee1},
     dsb, isb,
     pm::{GB, KB, MB},
-    tlbi_vmalle1,
+    print, tlbi_vmalle1,
 };
 use core::{arch::asm, cell::UnsafeCell, ptr::slice_from_raw_parts_mut};
 use core::{cell::OnceCell, fmt::Display, hash::Hash, ptr::NonNull};
@@ -186,6 +186,42 @@ fn map_v2p_4k(v: usize, p: usize) -> Result<usize, Error> {
     Ok(v)
 }
 
+pub fn v2p(v: usize) -> Option<usize> {
+    let pt_lock = PT.acquire();
+    let l0_pt = &mut pt_lock.as_mut().data;
+
+    let vaddr = Vaddr::new(v);
+
+    let l1_pt = l0_pt[vaddr.l0() as usize];
+
+    if l1_pt == 0 {
+        return None;
+    }
+
+    let l1_pt = wrap(l1_pt as usize & !0xfff) as *const u64;
+    let l2_pt = unsafe { *l1_pt.add(vaddr.l1() as usize) };
+
+    if l2_pt == 0 {
+        return None;
+    }
+
+    let l2_pt = wrap(l2_pt as usize & !0xfff) as *const u64;
+    let l3_pt = unsafe { *l2_pt.add(vaddr.l2() as usize) };
+
+    if l3_pt == 0 {
+        return None;
+    }
+
+    let l3_pt = wrap(l3_pt as usize & !0xfff) as *const u64;
+    let paddr = unsafe { *l3_pt.add(vaddr.l3() as usize) };
+
+    free_4k_direct(l1_pt as usize);
+    free_4k_direct(l2_pt as usize);
+    free_4k_direct(l3_pt as usize);
+
+    Some((paddr as usize & !0xfff) | (v & 0xfff))
+}
+
 pub fn init(k_begin: usize, k_end: usize) {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
@@ -207,6 +243,7 @@ pub fn init(k_begin: usize, k_end: usize) {
 
     dsb!();
     isb!();
+    arch::w_ttbr0_el1(0);
     arch::w_ttbr1_el1(neg1);
     tlbi_vmalle1!();
     dsb!();
@@ -307,22 +344,37 @@ impl Region {
         last.nxt = NonNull::new(other as *mut Region)
     }
 
-    fn alloc_1(&mut self) -> Option<usize> {
+    fn alloc(&mut self, n: usize) -> Option<usize> {
         if self.is_full() || self.is_uninit() {
             // TODO append if full
             return None;
         }
 
+        if self.bits.count_zeros() < n as u32 {
+            // TODO append if full
+            return None;
+        }
+
+        let mut found = 0;
+
         let mut bits = self.bits;
+        let mut tmp_bits = self.bits;
         for i in 0..64 {
             if (bits & 1) == 0 {
-                self.bits |= 1u64 << i;
-                return Some(self.start + i * 4 * KB);
+                tmp_bits |= 1u64 << i;
+                found += 1;
+
+                if found == n {
+                    self.bits = tmp_bits;
+                    return Some(self.start + (i - (n - 1)) * 4 * KB);
+                }
+            } else {
+                found = 0;
             }
             bits >>= 1;
         }
 
-        unreachable!()
+        None
     }
 
     fn free_inner(&mut self, addr: usize) -> Option<()> {
@@ -370,8 +422,21 @@ fn init_regions(start_p: usize) {
 
 pub fn alloc_4k() -> Option<usize> {
     let lock = REGIONS.acquire();
-    lock.as_mut().alloc_1()
+    lock.as_mut().alloc(1)
 }
+
+pub fn alloc(n: usize) -> Option<usize> {
+    let lock = REGIONS.acquire();
+    lock.as_mut().alloc(n)
+}
+
+pub fn free(addr: usize, n: usize) {
+    let lock = REGIONS.acquire();
+    for i in 0..n {
+        lock.as_mut().free_1(addr + (i * 4 * KB));
+    }
+}
+
 pub fn free_4k(v: usize) {
     let lock = REGIONS.acquire();
     lock.as_mut().free_1(v)
@@ -379,7 +444,7 @@ pub fn free_4k(v: usize) {
 
 pub fn alloc_4k_direct() -> Option<usize> {
     let lock = DIRECTS.acquire();
-    lock.as_mut().alloc_1()
+    lock.as_mut().alloc(1)
 }
 
 fn free_4k_direct(v: usize) {
@@ -390,6 +455,18 @@ fn free_4k_direct(v: usize) {
 pub fn map_4k(p: usize) -> Result<usize, Error> {
     match alloc_4k() {
         Some(v) => map_v2p_4k(v, p),
+        _ => Err(Error),
+    }
+}
+
+pub fn map(p: usize, n: usize) -> Result<usize, Error> {
+    match alloc(n) {
+        Some(v) => {
+            for i in 0..n {
+                map_v2p_4k(v + (i * 4 * KB), p + (i * 4 * KB)).unwrap();
+            }
+            Ok(v)
+        }
         _ => Err(Error),
     }
 }

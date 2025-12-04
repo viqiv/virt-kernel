@@ -1,10 +1,8 @@
-use crate::{spin, vm};
+use crate::{stuff::StaticMut, trap::gic_enable_intr, vm};
 
-struct Data {
-    map: usize,
-}
+static MAP: StaticMut<usize> = StaticMut::new(0);
 
-static LOCK: spin::Lock<Data> = spin::Lock::new("uart", Data { map: 0 });
+// static LOCK: spin::Lock<()> = spin::Lock::new("uart", ());
 
 #[inline]
 fn write_char(c: u8, map: usize) {
@@ -22,8 +20,7 @@ pub struct Writer;
 
 impl core::fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let lock = LOCK.acquire();
-        write_bytes(s.as_bytes(), lock.as_ref().map);
+        write_bytes(s.as_bytes(), *MAP);
         Ok(())
     }
 }
@@ -36,11 +33,14 @@ macro_rules! print {
     }};
 }
 
-pub fn init() {
+pub fn init_tx() {
     let v = vm::map_4k(0x9000000).unwrap();
-    let lock = LOCK.acquire();
-    lock.as_mut().map = v;
+    *MAP.get_mut() = v;
     enable_tx(v);
+}
+
+pub fn init_rx() {
+    enable_rx(*MAP);
 }
 
 pub fn enable_rx(map: usize) {
@@ -52,7 +52,9 @@ pub fn enable_rx(map: usize) {
         let cr = base.read_volatile() | 1u32 << 4;
         base.write_volatile(cr);
     }
+    gic_enable_intr(33);
 }
+
 pub fn enable_tx(map: usize) {
     let base = (map + 0x30) as *mut u32;
     unsafe {
@@ -61,15 +63,22 @@ pub fn enable_tx(map: usize) {
     }
 }
 
-pub fn clr_rx() {
-    let base = (0x9000000usize + 0x44) as *mut u32;
+fn clr_rx() {
+    let base = ((*MAP) + 0x44) as *mut u32;
     unsafe {
         let cr = 1u32 << 4;
         base.write_volatile(cr);
     }
 }
 
-pub fn read() -> u8 {
-    let dr = 0x9000000usize as *const u8;
+fn read() -> u8 {
+    let dr = (*MAP) as *const u8;
     unsafe { *dr }
+}
+
+pub fn handle_rx() {
+    let c = read();
+    print!("uart... {}\n", c as char);
+    // print!("{:?}\n", frame);
+    clr_rx();
 }

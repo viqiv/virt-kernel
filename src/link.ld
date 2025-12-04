@@ -30,7 +30,9 @@ SECTIONS {
     }
 
     . += 0xffff000000000000;
-    .text.vector ALIGN(4K) : {
+    .text.vector ALIGN(4K) :
+        AT(ADDR(.text.vector) - 0xffff000000000000) 
+         {
         _kernel_begin = . - 0xffff000000000000;
         _trap_vec = .;
         . += 0x200;
@@ -58,7 +60,8 @@ SECTIONS {
     .bss : AT(ADDR(.bss) - 0xffff000000000000) 
     {
         . = ALIGN(4096);
-        . += 4096;
+        _boot_stack_btm = .;
+        . += 32768;
         _boot_stack = .;
         *(.bss.*)
         *(.bss)

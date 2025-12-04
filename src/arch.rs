@@ -173,6 +173,24 @@ pub fn r_ttbr1_el1() -> u64 {
 }
 
 #[inline]
+pub fn r_far_el1() -> u64 {
+    let mut res = 0i64;
+    unsafe {
+        asm!("mrs {}, far_el1", out(reg) res);
+    }
+    res.cast_unsigned()
+}
+
+#[inline]
+pub fn r_sp() -> u64 {
+    let mut res = 0i64;
+    unsafe {
+        asm!("mov {}, sp", out(reg) res);
+    }
+    res.cast_unsigned()
+}
+
+#[inline]
 pub fn w_ttbr1_el1(r: u64) {
     unsafe {
         asm!("msr ttbr1_el1, {}", in(reg) r);
@@ -191,7 +209,7 @@ pub fn tlbi_aside1(asid: u64) {
 #[inline]
 pub fn tlbi_vaee1(v: u64) {
     unsafe {
-        asm!("tlbi vaae1 , {}", in(reg) v);
+        asm!("tlbi vaae1 , {}", in(reg) v>>12);
     }
 }
 
@@ -227,5 +245,12 @@ macro_rules! tlbi_vmalle1 {
 macro_rules! wfi {
     () => {
         unsafe { asm!("wfi") }
+    };
+}
+
+#[macro_export]
+macro_rules! udf {
+    () => {
+        unsafe { asm!("udf #0") }
     };
 }

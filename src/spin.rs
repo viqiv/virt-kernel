@@ -1,85 +1,56 @@
 use core::{
     cell::UnsafeCell,
+    hint::spin_loop,
     sync::atomic::{AtomicBool, Ordering},
 };
 
 struct Inner<T> {
     data: T,
     pub name: &'static str,
-    pub locked: AtomicBool,
 }
 
 pub struct Lock<T> {
     inner: UnsafeCell<Inner<T>>,
+    pub locked: AtomicBool,
 }
 
-unsafe impl<T: Sync> Sync for Lock<T> {}
+unsafe impl<T> Sync for Lock<T> {}
 
 impl<T> Lock<T> {
     pub const fn new(name: &'static str, data: T) -> Lock<T> {
         Lock {
-            inner: UnsafeCell::new(Inner {
-                name,
-                locked: AtomicBool::new(false),
-                data,
-            }),
+            inner: UnsafeCell::new(Inner { name, data }),
+            locked: AtomicBool::new(false),
         }
     }
 
-    pub fn acquire(&self) -> LockGuard<T> {
-        let inner = unsafe { self.inner.get().as_ref() }.unwrap();
+    pub fn acquire(&self) -> LockGuard<'_, T> {
         while let Err(_) =
-            inner
-                .locked
+            self.locked
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        {}
-        LockGuard {
-            lock: self as *const Lock<T> as *mut Lock<T>,
+        {
+            spin_loop();
         }
-    }
-
-    pub fn release(&self) {
-        let inner = unsafe { self.inner.get().as_ref() }.unwrap();
-        inner.locked.store(false, Ordering::Release);
+        LockGuard { lock: self }
     }
 }
 
-pub struct LockGuard<T> {
-    lock: *mut Lock<T>,
+pub struct LockGuard<'a, T> {
+    lock: &'a Lock<T>,
 }
 
-impl<T> LockGuard<T> {
+impl<'a, T> LockGuard<'a, T> {
     pub fn as_ref(&self) -> &T {
-        unsafe {
-            &self
-                .lock
-                .as_ref()
-                .unwrap()
-                .inner
-                .get()
-                .as_ref()
-                .unwrap()
-                .data
-        }
+        unsafe { &self.lock.inner.get().as_ref().unwrap().data }
     }
 
     pub fn as_mut(&self) -> &mut T {
-        unsafe {
-            &mut self
-                .lock
-                .as_ref()
-                .unwrap()
-                .inner
-                .get()
-                .as_mut()
-                .unwrap()
-                .data
-        }
+        unsafe { &mut self.lock.inner.get().as_mut().unwrap().data }
     }
 }
 
-impl<T> Drop for LockGuard<T> {
+impl<'a, T> Drop for LockGuard<'a, T> {
     fn drop(&mut self) {
-        unsafe { self.lock.as_ref().unwrap() }.release();
+        self.lock.locked.store(false, Ordering::Release);
     }
 }

@@ -1,7 +1,4 @@
-use crate::arch;
-use crate::print;
-use crate::timer;
-use crate::uart;
+use crate::{_boot_stack, arch, print, stuff::StaticMut, timer, uart, vm::map_4k, wfi};
 use core::arch::{asm, naked_asm};
 
 #[derive(Debug)]
@@ -16,34 +13,32 @@ pub struct Frame {
 pub extern "C" fn irq_handler(frame: &Frame) {
     let idx = gic_ack();
     match idx {
-        30 => {
-            let freq = timer::r_freq();
-            print!("timer... {:x}\n", freq);
-            timer::w_ptval_el0(freq / 10);
+        30 => timer::handle_tik(),
+        33 => uart::handle_rx(),
+        _ => {
+            print!("unhandled irq: {}\n", idx);
+            loop {
+                wfi!();
+            }
         }
-        33 => {
-            let c = uart::read();
-            print!("uart... {} {}\n", idx, c);
-            // print!("{:?}\n", frame);
-            uart::clr_rx();
-        }
-        _ => unreachable!(),
     };
     gic_eoi(idx);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sync_handler(frame: &Frame) {
-    // print!(
-    //     "sync... 0b{:b} 0x{:x}\n",
-    //     arch::r_esr_el1() >> 26,
-    //     arch::r_elr_el1()
-    // );
+    print!(
+        "sync... 0b{:b} 0x{:x} 0x{:x}\n",
+        arch::r_esr_el1() >> 26,
+        arch::r_elr_el1(),
+        arch::r_far_el1(),
+    );
+    print!("kernel stack top 0x{:x}\n", unsafe {
+        (&_boot_stack) as *const u64 as usize
+    });
     // print!("{:?}\n", frame);
     loop {
-        // unsafe {
-        //     asm!("wfi");
-        // }
+        wfi!();
     }
 }
 
@@ -174,19 +169,22 @@ pub extern "C" fn trap_vector() {
     )
 }
 
-const GIC_DIST: usize = 0x8000000;
-const GIC_CPU: usize = 0x8010000;
+static GIC_DIST: StaticMut<usize> = StaticMut::new(0);
+//0x8000000;
+static GIC_CPU: StaticMut<usize> = StaticMut::new(0);
+//0x8010000;
 
 #[allow(unused)]
+#[unsafe(no_mangle)]
 pub fn gic_enable() {
     unsafe {
-        let x = (GIC_CPU + 4) as *mut u32;
+        let x = ((*GIC_CPU) + 4) as *mut u32;
         x.write_volatile(0xff);
 
-        let x = GIC_DIST as *mut u32;
+        let x = (*GIC_DIST) as *mut u32;
         x.write_volatile(1);
 
-        let x = GIC_CPU as *mut u32;
+        let x = (*GIC_CPU) as *mut u32;
         x.write_volatile(1);
     };
 }
@@ -194,14 +192,14 @@ pub fn gic_enable() {
 #[allow(unused)]
 #[inline]
 pub fn gic_ack() -> u32 {
-    let ptr = (GIC_CPU + 0xc) as *const u32;
+    let ptr = ((*GIC_CPU) + 0xc) as *const u32;
     unsafe { ptr.read_volatile() }
 }
 
 #[allow(unused)]
 #[inline]
 pub fn gic_eoi(idx: u32) {
-    let ptr = (GIC_CPU + 0x10) as *mut u32;
+    let ptr = ((*GIC_CPU) + 0x10) as *mut u32;
     unsafe {
         ptr.write_volatile(idx);
     }
@@ -211,7 +209,7 @@ pub fn gic_eoi(idx: u32) {
 pub fn gic_enable_intr(idx: usize) {
     let back = idx / 32;
     let bit = idx % 32;
-    let back_ptr = (GIC_DIST + 0x100) as *mut u32;
+    let back_ptr = ((*GIC_DIST) + 0x100) as *mut u32;
     unsafe {
         let v = back_ptr.add(back).read_volatile() | (1u32 << bit);
         back_ptr.add(back).write_volatile(v);
@@ -222,9 +220,17 @@ pub fn gic_enable_intr(idx: usize) {
 pub fn gic_disable_intr(idx: usize) {
     let back = idx / 32;
     let bit = idx % 32;
-    let back_ptr = (GIC_DIST + 0x180) as *mut u32;
+    let back_ptr = ((*GIC_DIST) + 0x180) as *mut u32;
     unsafe {
         let v = back_ptr.add(back).read_volatile() | (1u32 << bit);
         back_ptr.add(back).write_volatile(v);
     }
+}
+
+pub fn init() {
+    let map = map_4k(0x8000000).unwrap();
+    *GIC_DIST.get_mut() = map;
+    let map = map_4k(0x8010000).unwrap();
+    *GIC_CPU.get_mut() = map;
+    gic_enable();
 }

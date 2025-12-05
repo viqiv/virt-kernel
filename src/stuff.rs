@@ -55,9 +55,13 @@ impl BitSet128 {
     pub const fn new(len: u8) -> Self {
         assert!(len <= 128);
         Self {
-            back: (!0u128) << len,
+            back: if len == 128 { 0 } else { (!0u128) << len },
             len,
         }
+    }
+
+    pub fn len(&self) -> u8 {
+        self.len
     }
 
     #[inline]

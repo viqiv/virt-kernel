@@ -1,10 +1,11 @@
 use core::{
     arch::asm,
+    hint::spin_loop,
     ptr::{NonNull, slice_from_raw_parts_mut},
 };
 
 use crate::{
-    dsb, print,
+    blk, dsb, print, rng,
     stuff::{BitSet128, StaticMut},
     vm::{self, map},
 };
@@ -37,16 +38,16 @@ use crate::{
 
 #[derive(Debug)]
 #[repr(C, align(512))]
-struct Regs {
+pub struct Regs {
     buf: [u8; 512],
 }
 
 impl Regs {
-    fn write<T>(&mut self, offt: usize, v: T) {
+    pub fn write<T>(&mut self, offt: usize, v: T) {
         unsafe { (self.buf.as_mut_ptr().add(offt) as *mut T).write_volatile(v) }
     }
 
-    fn read<T>(&self, offt: usize) -> T {
+    pub fn read<T>(&self, offt: usize) -> T {
         unsafe { self.buf.as_ptr().add(offt).cast::<T>().read_volatile() }
     }
 
@@ -235,7 +236,7 @@ impl Status {
 
 #[repr(packed, C)]
 #[derive(Debug, Clone, Copy)]
-struct VqDesc {
+pub struct VqDesc {
     /* Address (guest-physical). */
     addr: u64,
     /* Length.*/
@@ -301,11 +302,11 @@ impl VqDesc {
 
 #[repr(packed, C)]
 #[derive(Debug)]
-struct VqAvail<const N: usize> {
+pub struct VqAvail<const N: usize> {
     // #define VIRTQ_AVAIL_F_NO_INTERRUPT      1
-    flags: u16,
-    idx: u16,
-    ring: [u16; N],
+    pub flags: u16,
+    pub idx: u16,
+    pub ring: [u16; N],
     used_event: u16, /* Only if VIRTIO_F_EVENT_IDX */
 }
 
@@ -323,21 +324,21 @@ impl<const N: usize> VqAvail<N> {
 #[repr(packed, C)]
 #[derive(Debug, Copy, Clone)]
 /* le32 is used here for ids for padding reasons. */
-struct VqUsedElem {
+pub struct VqUsedElem {
     /* Index of start of used descriptor chain. */
-    id: u32,
+    pub id: u32,
     /* Total length of the descriptor chain which
     was used (written to) */
-    len: u32,
+    pub len: u32,
 }
 
 #[repr(packed, C)]
 #[derive(Debug)]
-struct VqUsed<const N: usize> {
+pub struct VqUsed<const N: usize> {
     // #define VIRTQ_USED_F_NO_NOTIFY  1
     flags: u16,
-    idx: u16,
-    ring: [VqUsedElem; N],
+    pub idx: u16,
+    pub ring: [VqUsedElem; N],
     avail_event: u16, /* Only if VIRTIO_F_EVENT_IDX */
 }
 
@@ -352,7 +353,7 @@ impl<const N: usize> VqUsed<N> {
     }
 }
 
-struct Q<const N: usize> {
+pub struct Q<const N: usize> {
     desc: [VqDesc; N],
     avail: VqAvail<N>,
     pub used: VqUsed<N>,
@@ -378,6 +379,7 @@ impl<const N: usize> Q<N> {
         match self.desc_bs.first_clr() {
             Some(f) => {
                 self.desc_bs.set(f);
+                self.desc_data[f as usize] = 0;
                 Some(f as u16)
             }
             _ => None,
@@ -397,6 +399,21 @@ impl<const N: usize> Q<N> {
         }
     }
 
+    pub fn pop_used(&mut self) {
+        let used = self.used.ring[self.used_pos as usize % N];
+        self.free_desc(used.id as usize);
+        self.used_pos = self.used_pos.wrapping_add(1);
+    }
+
+    pub fn peek_used(&self) -> Option<(&VqDesc, u64)> {
+        if self.used_pos == self.used.idx {
+            return None;
+        }
+        let used = self.used.ring[self.used_pos as usize % N];
+        let data = self.desc_data[self.used_pos as usize % N];
+        Some((self.get_desc(used.id as usize), data))
+    }
+
     pub fn get_desc_tail(&mut self, hidx: usize) -> usize {
         let mut d = self.get_desc(hidx);
         let mut i = 1;
@@ -410,8 +427,16 @@ impl<const N: usize> Q<N> {
         tail
     }
 
-    pub fn get_desc(&mut self, idx: usize) -> &mut VqDesc {
+    pub fn get_desc_mut(&mut self, idx: usize) -> &mut VqDesc {
         &mut self.desc[idx]
+    }
+
+    pub fn get_desc(&self, idx: usize) -> &VqDesc {
+        &self.desc[idx]
+    }
+
+    pub fn set_desc_data(&mut self, idx: usize, data: u64) {
+        self.desc_data[idx] = data;
     }
 
     pub fn desc_area_paddr(&self) -> (u32, u32) {
@@ -429,77 +454,89 @@ impl<const N: usize> Q<N> {
         ((p & 0xffff_ffff) as u32, (p >> 32) as u32)
     }
 
-    pub fn add_avail(&mut self, head: u16) {
+    pub fn add_avail(&mut self, head: u16) -> u16 {
+        let used_idx = self.used.idx;
         self.avail.ring[self.avail.idx as usize % N] = head;
         self.avail.idx = self.avail.idx.wrapping_add(1);
         dsb!();
+        used_idx
+    }
+
+    pub fn len(&self) -> u32 {
+        N as u32
+    }
+
+    pub fn wait_use(&self, old_use: u16) {
+        while self.used.idx == old_use {
+            spin_loop();
+        }
     }
 }
 
 #[inline]
-fn select_q(regs: &mut Regs, pos: u32) {
+pub fn select_q(regs: &mut Regs, pos: u32) {
     regs.write(Regs::QUEUESEL, pos);
     dsb!();
 }
 
 #[inline]
-fn get_qlen_max(regs: &mut Regs, qpos: u32) -> u32 {
+pub fn get_qlen_max(regs: &mut Regs, qpos: u32) -> u32 {
     select_q(regs, qpos);
     regs.read(Regs::QUEUENUMMAX)
 }
 
 #[inline]
-fn set_ready(regs: &mut Regs, qpos: u32) {
+pub fn set_ready(regs: &mut Regs, qpos: u32) {
     select_q(regs, qpos);
     regs.write(Regs::QUEUEREADY, 1u32);
     dsb!();
 }
 
 #[inline]
-fn notify_q(regs: &mut Regs, qpos: u32) {
+pub fn notify_q(regs: &mut Regs, qpos: u32) {
     select_q(regs, qpos);
     regs.write(Regs::QUEUENOTIFY, qpos);
     dsb!();
 }
 
 #[inline]
-fn get_status(regs: &mut Regs) -> u32 {
+pub fn get_status(regs: &mut Regs) -> u32 {
     regs.read(Regs::STATUS)
 }
 
 #[inline]
-fn get_irq_status(regs: &mut Regs) -> u32 {
+pub fn get_irq_status(regs: &mut Regs) -> u32 {
     regs.read(Regs::INTERRUPTSTATUS)
 }
 
 #[inline]
-fn irq_ack(regs: &mut Regs, v: u32) {
+pub fn irq_ack(regs: &mut Regs, v: u32) {
     regs.write(Regs::INTERRUPTACK, v)
 }
 
 #[inline]
-fn set_desc_area(regs: &mut Regs, paddr: (u32, u32)) {
+pub fn set_desc_area(regs: &mut Regs, paddr: (u32, u32)) {
     regs.write(Regs::QUEUEDESCLOW, paddr.0);
     regs.write(Regs::QUEUEDESCHIGH, paddr.1);
     dsb!();
 }
 
 #[inline]
-fn set_used_area(regs: &mut Regs, paddr: (u32, u32)) {
+pub fn set_used_area(regs: &mut Regs, paddr: (u32, u32)) {
     regs.write(Regs::QUEUEDEVICELOW, paddr.0);
     regs.write(Regs::QUEUEDEVICEHIGH, paddr.1);
     dsb!();
 }
 
 #[inline]
-fn set_avail_area(regs: &mut Regs, paddr: (u32, u32)) {
+pub fn set_avail_area(regs: &mut Regs, paddr: (u32, u32)) {
     regs.write(Regs::QUEUEDRIVERLOW, paddr.0);
     regs.write(Regs::QUEUEDRIVERHIGH, paddr.1);
     dsb!();
 }
 
 #[inline]
-fn set_q_len(regs: &mut Regs, qpos: u32, len: u32) {
+pub fn set_q_len(regs: &mut Regs, qpos: u32, len: u32) {
     select_q(regs, qpos);
     let qlen_max = get_qlen_max(regs, qpos);
     assert!(len <= qlen_max);
@@ -528,343 +565,621 @@ pub fn init() {
             4 => {
                 // virtio-rng
                 print!("virtio-rng found.\n");
+                rng::init(reg);
             }
             9 => {
                 // virtio-9p
                 print!("virtio-9p found.\n");
+                p9::init(reg);
             }
             _ => {}
         }
-        // print!("id [{}] {}\n", i, reg.read::<u32>(DEVICEID));
     }
 }
 
-pub mod blk {
-    use ::alloc::boxed::Box;
+pub fn init_dev_common(reg: &mut Regs, features: u32) {
+    reg.write::<u32>(Regs::STATUS, 0);
+    dsb!();
+    let mut status: u32 = reg.read(Regs::STATUS);
+    reg.write(Regs::STATUS, status | Status::ACKNOWLEDGE);
+    dsb!();
+    reg.write(Regs::STATUS, status | Status::DRIVER);
+    dsb!();
+    reg.write(Regs::DEVICEFEATURESSEL, 0u32);
+    reg.write(Regs::DRIVERFEATURESSEL, 0u32);
+    dsb!();
+    // let device_features: u32 = reg.read(Regs::DEVICEFEATURES);
+    reg.write(Regs::DRIVERFEATURES, features);
+    status = reg.read(Regs::STATUS);
+    dsb!();
+    reg.write(Regs::STATUS, status | Status::FEATURES_OK);
+    dsb!();
+    status = reg.read(Regs::STATUS);
+    if (status & Status::FEATURES_OK) == 0 {
+        panic!("virt feature not ok.");
+    }
+}
+
+pub mod p9 {
+    use core::{
+        arch::asm,
+        hint::spin_loop,
+        mem::{ManuallyDrop, forget},
+        ptr::NonNull,
+    };
+
+    use alloc::{str, vec::Vec};
 
     use crate::{
         dsb, print,
+        rng::irq_pending,
         spin::Lock,
-        virtio::{self, Q, Regs, Status, VqDesc},
-        vm,
+        stuff::BitSet128,
+        virtio::{self, Q, Regs, Status, get_irq_status, init_dev_common, irq_ack},
     };
-    use core::{alloc, any::Any, arch::asm, fmt::Pointer, ptr::NonNull};
 
-    const QSIZE: usize = 4;
-
-    struct VirtioBlk {
-        regs: NonNull<Regs>,
-        vq: Q<QSIZE>,
+    enum Buf<'a> {
+        Own(Vec<u8>),
+        Borrowed(&'a [u8]),
     }
 
-    // static REGS: StaticMut<Option<&mut Regs>> = StaticMut::new(None);
-    // static VQ: StaticMut<Q<4>> = StaticMut::new(Q::new());
-    static BLK: Lock<VirtioBlk> = Lock::new(
-        "virtio-blk",
-        VirtioBlk {
-            regs: NonNull::dangling(),
-            vq: Q::new(),
-        },
-    );
-
-    struct Features;
-
-    impl Features {
-        // Maximum size of any single segment is in size_max.
-        const SIZE_MAX: u32 = 1;
-        // Maximum number of segments in a request is in seg_max.
-        const SEG_MAX: u32 = 2;
-        // Disk-style geometry specified in geometry.
-        const GEOMETRY: u32 = 4;
-        // Device is read-only.
-        const RO: u32 = 5;
-        // Block size of disk is in blk_size.
-        const BLK_SIZE: u32 = 6;
-        // Cache flush command support.
-        const FLUSH: u32 = 9;
-        // Device exports information on optimal I/O alignment.
-        const TOPOLOGY: u32 = 10;
-        // Device can toggle its cache between writeback and writethrough modes.
-        const CONFIG_WCE: u32 = 11;
-        // Device can support discard command, maximum discard sectors size in max_discard_sectors and maximum discard segment number in max_discard_seg.
-        const DISCARD: u32 = 13;
-        // Device can support write zeroes command, maximum write zeroes sectors size in max_write_zeroes_sectors and maximum write zeroes segment number in max_write_zeroes_seg.
-        const WRITE_ZEROES: u32 = 14;
+    struct Msg<'a> {
+        buf: Buf<'a>,
+        pos: usize,
     }
 
-    struct ReqKind;
-    impl ReqKind {
-        const IN: u32 = 0;
-        const OUT: u32 = 1;
-        const FLUSH: u32 = 4;
-        const DISCARD: u32 = 11;
-        const WRITE_ZEROES: u32 = 13;
-    }
-
-    struct ReqStatus;
-    impl ReqStatus {
-        const OK: u8 = 0;
-        const IOERR: u8 = 1;
-        const UNSUPP: u8 = 2;
-    }
-
-    #[repr(packed, C)]
-    #[derive(Debug)]
-    struct Req {
-        kind: u32,
-        reserved: u32,
-        sector: u64,
-        // data: *mut [u8; 512],
-        status: u8,
-    }
-
-    impl Req {
-        const fn new(kind: u32, sector: u64) -> Self {
-            Self {
-                kind,
-                reserved: 0,
-                sector,
-                status: 0,
+    impl<'a> Msg<'a> {
+        fn new_own() -> Msg<'a> {
+            Msg {
+                buf: Buf::Own(Vec::new()),
+                pos: 0,
             }
         }
 
-        #[inline]
-        fn paddr(&self) -> usize {
-            vm::v2p(self as *const Req as usize).unwrap()
+        fn new_borrowed(buf: &'a [u8]) -> Msg<'a> {
+            Msg {
+                buf: Buf::Borrowed(buf),
+                pos: 0,
+            }
         }
 
-        #[inline]
-        fn status_paddr(&self) -> usize {
-            vm::v2p(self as *const Req as usize).unwrap() + 16
+        pub fn get_buf(&self) -> &[u8] {
+            match &self.buf {
+                Buf::Own(v) => v.as_slice(),
+                Buf::Borrowed(s) => s,
+            }
+        }
+
+        fn get_vec(&mut self) -> &mut Vec<u8> {
+            match &mut self.buf {
+                Buf::Own(v) => v,
+                _ => panic!("read only"),
+            }
+        }
+
+        fn get_buf_ptr(&self) -> *const u8 {
+            (&self.get_buf()[0]) as *const u8
+        }
+
+        fn get_self_ptr(&self) -> u64 {
+            self as *const Msg as u64
+        }
+
+        pub fn read_u8(&mut self) -> Option<u8> {
+            let buf = self.get_buf();
+            if buf.len() < self.pos {
+                return None;
+            }
+            let b = buf[self.pos];
+            self.pos += 1;
+            Some(b)
+        }
+
+        pub fn read_u16(&mut self) -> Option<u16> {
+            let buf = self.get_buf();
+            if buf.len() < self.pos + 1 {
+                return None;
+            }
+            let w = u16::from_le_bytes(buf[self.pos..][0..2].try_into().unwrap());
+            self.pos += 2;
+            Some(w)
+        }
+
+        pub fn read_u32(&mut self) -> Option<u32> {
+            let buf = self.get_buf();
+            if buf.len() < self.pos + 3 {
+                return None;
+            }
+            let d = u32::from_le_bytes(buf[self.pos..][0..4].try_into().unwrap());
+            self.pos += 4;
+            Some(d)
+        }
+
+        pub fn read_u64(&mut self) -> Option<u64> {
+            let buf = self.get_buf();
+            if buf.len() < self.pos + 7 {
+                return None;
+            }
+            let q = u64::from_le_bytes(buf[self.pos..][0..8].try_into().unwrap());
+            self.pos += 8;
+            Some(q)
+        }
+
+        pub fn read_str(&mut self) -> Option<&str> {
+            let len = self.read_u16().unwrap() as usize;
+            let buf = self.get_buf();
+            if self.pos + len < buf.len() {
+                return None;
+            }
+            match str::from_utf8(&buf[self.pos..][0..len as usize]) {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            }
+        }
+
+        pub fn write_slice(&mut self, slice: &[u8]) {
+            let pos = self.pos;
+            let vec = self.get_vec();
+            if pos + slice.len() > vec.len() {
+                vec.resize(pos + slice.len(), 0);
+            }
+            vec[pos..][0..slice.len()].copy_from_slice(slice);
+            self.pos += slice.len();
+        }
+
+        pub fn ensure(&mut self, ns: usize) {
+            let vec = self.get_vec();
+            if ns > vec.len() {
+                vec.resize(ns, 0);
+            }
+        }
+
+        pub fn write_u8(&mut self, v: u8) {
+            self.write_slice(&[v]);
+        }
+
+        pub fn write_u16(&mut self, v: u16) {
+            self.write_slice(&v.to_le_bytes());
+        }
+
+        pub fn write_u32(&mut self, v: u32) {
+            self.write_slice(&v.to_le_bytes());
+        }
+
+        pub fn write_u64(&mut self, v: u64) {
+            self.write_slice(&v.to_le_bytes());
+        }
+
+        pub fn write_str(&mut self, s: &str) {
+            self.write_u16(s.as_bytes().len() as u16);
+            self.write_slice(s.as_bytes());
+        }
+
+        pub fn seek(&mut self, pos: usize) {
+            assert!(pos <= self.get_buf().len());
+            self.pos = pos
+        }
+
+        pub fn tell(&self) -> usize {
+            self.pos
+        }
+
+        pub fn skip(&mut self, n: usize) {
+            self.seek(self.pos + n);
         }
     }
 
-    #[repr(packed, C)]
-    #[derive(Debug)]
-    struct Geometry {
-        cylinders: u16,
-        heads: u8,
-        sectors: u8,
+    const QSIZE: usize = 8;
+
+    #[repr(u8)]
+    #[derive(Debug, Clone, Copy)]
+    pub enum QIDKind {
+        QTDIR = 0x80,
+        QTAPPEND = 0x40,
+        QTEXCL = 0x20,
+        QTMOUNT = 0x10,
+        QTAUTH = 0x08,
+        QTTMP = 0x04,
+        QTSYMLINK = 0x02,
+        QTLINK = 0x01,
+        QTFILE = 0x00,
     }
 
-    #[repr(packed, C)]
-    #[derive(Debug)]
-    struct Topology {
-        // # of logical blocks per physical block (log2)
-        physical_block_exp: u8,
-        // offset of first aligned logical block
-        alignment_offset: u8,
-        // suggested minimum I/O size in blocks
-        min_io_size: u16,
-        // optimal (suggested maximum) I/O size in blocks
-        opt_io_size: u16,
+    impl TryFrom<u8> for QIDKind {
+        type Error = ();
+        fn try_from(value: u8) -> Result<Self, Self::Error> {
+            match value {
+                0x0 => Ok(QIDKind::QTFILE),
+                0x01 => Ok(QIDKind::QTLINK),
+                0x02 => Ok(QIDKind::QTSYMLINK),
+                0x04 => Ok(QIDKind::QTTMP),
+                0x08 => Ok(QIDKind::QTAUTH),
+                0x10 => Ok(QIDKind::QTMOUNT),
+                0x20 => Ok(QIDKind::QTEXCL),
+                0x40 => Ok(QIDKind::QTAPPEND),
+                0x80 => Ok(QIDKind::QTDIR),
+                _ => Err(()),
+            }
+        }
     }
 
-    #[repr(packed, C)]
-    // #[derive(Debug)]
-    struct Config {
-        capacity: u64,
-        size_max: u32,
-        seg_max: u32,
-        geometry: Geometry,
-        blk_size: u32,
-        topology: Topology,
-        writeback: u8,
-        unused0: [u8; 3],
-        max_discard_sectors: u32,
-        max_discard_seg: u32,
-        discard_sector_alignment: u32,
-        max_write_zeroes_sectors: u32,
-        max_write_zeroes_seg: u32,
-        write_zeroes_may_unmap: u8,
-        unused1: [u8; 3],
+    #[derive(Clone, Copy, Debug)]
+    pub struct QID {
+        pub kind: QIDKind,
+        pub version: u32,
+        pub path: u64,
     }
 
-    pub fn init(reg: &mut Regs) {
-        let lock = BLK.acquire();
-        let blk = lock.as_mut();
-
-        if blk.regs != NonNull::dangling() {
-            /*TODO*/
-            return;
+    impl QID {
+        const fn new() -> QID {
+            QID {
+                kind: QIDKind::QTDIR,
+                version: 0,
+                path: 0,
+            }
         }
-
-        fn get_config(reg: &mut Regs) -> &Config {
-            unsafe { (((reg as *mut Regs as usize) + Regs::CONFIG) as *mut Config).as_ref() }
-                .unwrap()
-        }
-
-        blk.regs = NonNull::new(reg as *mut Regs).unwrap();
-
-        reg.write::<u32>(Regs::STATUS, 0);
-        dsb!();
-        let mut status: u32 = reg.read(Regs::STATUS);
-        reg.write(Regs::STATUS, status | Status::ACKNOWLEDGE);
-        dsb!();
-        reg.write(Regs::STATUS, status | Status::DRIVER);
-        dsb!();
-        // status = reg.read(Regs::STATUS);
-        reg.write(Regs::DEVICEFEATURESSEL, 0u32);
-        reg.write(Regs::DRIVERFEATURESSEL, 0u32);
-        dsb!();
-        let device_features: u32 = reg.read(Regs::DEVICEFEATURES);
-        reg.write(
-            Regs::DRIVERFEATURES,
-            Features::BLK_SIZE | Features::SIZE_MAX | Features::SIZE_MAX,
-        );
-        status = reg.read(Regs::STATUS);
-        dsb!();
-        reg.write(Regs::STATUS, status | Status::FEATURES_OK);
-        dsb!();
-        status = reg.read(Regs::STATUS);
-        print!("blk: status {} features {}\n", status, device_features);
-
-        if (status & Status::FEATURES_OK) == 0 {
-            panic!("virt-blk feature not ok.");
-        }
-
-        reg.write(Regs::STATUS, status | Status::DRIVER_OK);
-        dsb!();
-
-        virtio::set_q_len(reg, 0, 4);
-        virtio::set_used_area(reg, blk.vq.used_area_paddr());
-        virtio::set_avail_area(reg, blk.vq.avail_area_paddr());
-        virtio::set_desc_area(reg, blk.vq.desc_area_paddr());
     }
 
-    fn rw(sect: u64, buf: *const u8, len: usize, r: bool) -> Result<(), ()> {
-        if len % 512 != 0 {
-            return Err(());
+    struct P9 {
+        q: Q<QSIZE>,
+        fid_bs: BitSet128,
+        tag: u16,
+        qid: QID,
+        regs: Option<NonNull<Regs>>,
+    }
+
+    impl P9 {
+        fn alloc_fid(&mut self) -> Option<u32> {
+            match self.fid_bs.first_clr() {
+                Some(i) => {
+                    self.fid_bs.set(i);
+                    Some(i as u32)
+                }
+                _ => None,
+            }
         }
 
-        if len > u32::MAX as usize {
-            return Err(());
+        fn free_fid(&mut self, fid: u32) {
+            assert!(fid < self.fid_bs.len() as u32);
+            assert!(self.fid_bs.tst(fid as u8));
+            self.fid_bs.clr(fid as u8);
         }
 
-        let kind = if r { ReqKind::IN } else { ReqKind::OUT };
-        let req = Box::new(Req::new(kind, sect));
+        pub fn next_tag(&mut self) -> u16 {
+            let tag = self.tag;
+            self.tag = tag.wrapping_add(1);
+            tag
+        }
+    }
 
-        let lock = BLK.acquire();
-        let blk = lock.as_mut();
-        // assert!(blk.regs != NonNull::dangling());
+    #[repr(u8)]
+    #[allow(non_camel_case_types)]
+    enum Op {
+        TLERROR = 6,
+        RLERROR,
+        TSTATFS = 8,
+        RSTATFS,
+        TLOPEN = 12,
+        RLOPEN,
+        TLCREATE = 14,
+        RLCREATE,
+        TSYMLINK = 16,
+        RSYMLINK,
+        TMKNOD = 18,
+        RMKNOD,
+        TRENAME = 20,
+        RRENAME,
+        TREADLINK = 22,
+        RREADLINK,
+        TGETATTR = 24,
+        RGETATTR,
+        TSETATTR = 26,
+        RSETATTR,
+        TXATTRWALK = 30,
+        RXATTRWALK,
+        TXATTRCREATE = 32,
+        RXATTRCREATE,
+        TREADDIR = 40,
+        RREADDIR,
+        TFSYNC = 50,
+        RFSYNC,
+        TLOCK = 52,
+        RLOCK,
+        TGETLOCK = 54,
+        RGETLOCK,
+        TLINK = 70,
+        RLINK,
+        TMKDIR = 72,
+        RMKDIR,
+        TRENAMEAT = 74,
+        RRENAMEAT,
+        TUNLINKAT = 76,
+        RUNLINKAT,
+        TVERSION = 100,
+        RVERSION,
+        TAUTH = 102,
+        RAUTH,
+        TATTACH = 104,
+        RATTACH,
+        TERROR = 106,
+        RERROR,
+        TFLUSH = 108,
+        RFLUSH,
+        TWALK = 110,
+        RWALK,
+        TOPEN = 112,
+        ROPEN,
+        TCREATE = 114,
+        RCREATE,
+        TREAD = 116,
+        RREAD,
+        TWRITE = 118,
+        RWRITE,
+        TCLUNK = 120,
+        RCLUNK,
+        TREMOVE = 122,
+        RREMOVE,
+        TSTAT = 124,
+        RSTAT,
+        TWSTAT = 126,
+        RWSTAT,
+    }
 
-        // print!("first clr.....\n");
-        let d1_idx = blk.vq.alloc_desc().unwrap();
-        let d2_idx = blk.vq.alloc_desc().unwrap();
-        let d3_idx = blk.vq.alloc_desc().unwrap();
+    const VERSION: &'static str = "9P2000.L";
 
-        let d1 = blk.vq.get_desc(d1_idx as usize);
-        // let k = Box::new(0u8);
+    static P9L: Lock<P9> = Lock::new(
+        "9p",
+        P9 {
+            q: Q::new(),
+            fid_bs: BitSet128::new(128),
+            tag: 0,
+            qid: QID::new(),
+            regs: None,
+        },
+    );
 
-        d1.set_next(d2_idx)
-            .set_len(16)
-            .set_data(req.as_ref().paddr() as u64);
+    fn set_version(p9: &mut P9) {
+        //size[4] Tversion tag[2] msize[4] version[s]
+        let mut msg = Msg::new_own();
+        msg.write_u32(0);
+        msg.write_u8(Op::TVERSION as u8);
+        msg.write_u16(0);
+        msg.write_u32(u16::MAX as u32);
+        let vpos = msg.tell();
+        msg.write_str(VERSION);
+        let len = msg.tell();
+        msg.seek(0);
+        msg.write_u32(len as u32);
 
-        let d2 = blk.vq.get_desc(d2_idx as usize);
-        d2.set_next(d3_idx)
+        let d1 = p9.q.alloc_desc().unwrap();
+        let d2 = p9.q.alloc_desc().unwrap();
+
+        let desc1 = p9.q.get_desc_mut(d1 as usize);
+        desc1
+            .set_next(d2)
+            .set_data(msg.get_buf_ptr() as u64)
+            .set_len(len as u32);
+
+        let desc2 = p9.q.get_desc_mut(d2 as usize);
+
+        desc2
+            .set_writable()
             .set_len(len as u32)
-            .set_data(vm::v2p(buf as *const u8 as usize).unwrap() as u64);
-        if r {
-            d2.set_writable();
-        }
+            .set_data(msg.get_buf_ptr() as u64);
 
-        let d3 = blk.vq.get_desc(d3_idx as usize);
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
 
-        d3.set_writable()
-            .set_len(1)
-            .set_data(req.as_ref().status_paddr() as u64);
-
-        // print!("====> req before: {:?}\n", req);
-        blk.vq.desc_data[d1_idx as usize] = Box::into_raw(req) as u64;
-
-        let regs = unsafe { blk.regs.as_mut() };
-
-        blk.vq.add_avail(d1_idx);
+        let old = p9.q.add_avail(d1);
         virtio::set_ready(regs, 0);
         virtio::notify_q(regs, 0);
-        Ok(())
+
+        p9.q.wait_use(old);
+        p9.q.pop_used();
+        let irq_s = get_irq_status(regs);
+        irq_ack(regs, irq_s);
+
+        msg.seek(4);
+        let resp_kind = msg.read_u8().unwrap();
+        msg.seek(vpos);
+        let rv = msg.read_str().unwrap();
+        assert!(resp_kind == Op::RVERSION as u8 && rv == VERSION);
+        // print!("rv: {}\n", rv);
     }
 
-    pub fn read(sect: u64, buf: &mut [u8]) -> Result<(), ()> {
-        let ptr = (&buf[0]) as *const u8;
-        let len = buf.len();
-        match rw(sect, ptr, len, true) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(()),
+    pub fn attach(p9: &mut P9) {
+        // size[4] Tattach tag[2] fid[4] afid[4] uname[s] aname[s] n_uname[4]
+        // size[4] Rattach tag[2] qid[13]
+        let mut msg = Msg::new_own();
+        msg.ensure(20);
+        msg.write_u32(0);
+        msg.write_u8(Op::TATTACH as u8);
+        msg.write_u16(p9.next_tag());
+        msg.write_u32(p9.alloc_fid().unwrap());
+        msg.write_u32(!0u32);
+        msg.write_str("root");
+        msg.write_str("");
+        msg.write_u32(0);
+        let len = msg.tell();
+        msg.seek(0);
+        msg.write_u32(len as u32);
+        // print!("len = {}\n", len);
+
+        let d1 = p9.q.alloc_desc().unwrap();
+        let d2 = p9.q.alloc_desc().unwrap();
+
+        let desc1 = p9.q.get_desc_mut(d1 as usize);
+        desc1
+            .set_next(d2)
+            .set_data(msg.get_buf_ptr() as u64)
+            .set_len(len as u32);
+
+        let desc2 = p9.q.get_desc_mut(d2 as usize);
+
+        desc2
+            .set_writable()
+            .set_len(20)
+            .set_data(msg.get_buf_ptr() as u64);
+
+        let old = p9.q.add_avail(d1);
+
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
+        virtio::set_ready(regs, 0);
+        virtio::notify_q(regs, 0);
+
+        p9.q.wait_use(old);
+        p9.q.pop_used();
+        let irq_s = get_irq_status(regs);
+        irq_ack(regs, irq_s);
+
+        msg.seek(4);
+        let resp_kind = msg.read_u8().unwrap();
+        assert!(resp_kind == Op::RATTACH as u8);
+        msg.seek(7);
+        p9.qid.kind = msg.read_u8().unwrap().try_into().unwrap();
+        p9.qid.version = msg.read_u32().unwrap();
+        p9.qid.path = msg.read_u64().unwrap();
+    }
+
+    fn path_to_wnames(path: &str) -> Vec<&str> {
+        path.split('/').filter(|s| !s.is_empty()).collect()
+    }
+
+    pub fn walk(path: &'static str) -> Result<(u32, QID), ()> {
+        if path.is_empty() {
+            return Err(());
         }
-    }
 
-    pub fn write(sect: u64, buf: &[u8]) -> Result<(), ()> {
-        let ptr = (&buf[0]) as *const u8;
-        let len = buf.len();
-        match rw(sect, ptr, len, false) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(()),
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+
+        if path == "/" {
+            return Ok((0, p9.qid));
         }
-    }
 
-    pub fn read_sync(sect: u64, buf: &mut [u8]) -> Result<(), ()> {
-        read(sect, buf)?;
-        while !pending_irq() {}
-        match irq_handle() {
-            Ok(_) => Ok(()),
-            _ => Err(()),
+        let wnames = path_to_wnames(path);
+        if wnames.len() > u16::MAX as usize {
+            return Err(());
         }
-    }
-
-    pub fn write_sync(sect: u64, buf: &[u8]) -> Result<(), ()> {
-        write(sect, buf)?;
-        while !pending_irq() {}
-        match irq_handle() {
-            Ok(_) => Ok(()),
-            _ => Err(()),
+        print!("wnames {:?}\n", wnames);
+        // size[4] Twalk tag[2] fid[4] newfid[4] nwname[2] nwname*(wname[s])
+        // size[4] Rwalk tag[2] nwqid[2] nwqid*(wqid[13])
+        let mut msg = Msg::new_own();
+        let resp_len = 22 + 13 * wnames.len();
+        msg.ensure(resp_len);
+        msg.write_u32(0);
+        msg.write_u8(Op::TWALK as u8);
+        msg.write_u16(p9.next_tag());
+        msg.write_u32(0);
+        let fid = p9.alloc_fid().unwrap();
+        msg.write_u32(fid);
+        msg.write_u16(wnames.len() as u16);
+        for i in 0..wnames.len() {
+            msg.write_str(wnames[i]);
         }
+        let len = msg.tell();
+        msg.seek(0);
+        msg.write_u32(len as u32);
+
+        let d1 = p9.q.alloc_desc().unwrap();
+        let d2 = p9.q.alloc_desc().unwrap();
+
+        let desc1 = p9.q.get_desc_mut(d1 as usize);
+        desc1
+            .set_next(d2)
+            .set_data(msg.get_buf_ptr() as u64)
+            .set_len(len as u32);
+
+        let desc2 = p9.q.get_desc_mut(d2 as usize);
+
+        desc2
+            .set_writable()
+            .set_len(resp_len as u32)
+            .set_data(msg.get_buf_ptr() as u64);
+
+        p9.q.set_desc_data(d1 as usize, msg.get_self_ptr());
+        let old = p9.q.add_avail(d1);
+
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
+        virtio::set_ready(regs, 0);
+        virtio::notify_q(regs, 0);
+
+        {
+            p9.q.wait_use(old);
+            p9.q.pop_used();
+            let irq_s = get_irq_status(regs);
+            irq_ack(regs, irq_s);
+        }
+        // TODO sleep
+
+        msg.seek(4);
+        let resp_kind = msg.read_u8().unwrap();
+        print!("RESP: {}\n", resp_kind);
+        if resp_kind != Op::RWALK as u8 {
+            return Err(());
+        }
+        msg.seek(7);
+        let qid_len = msg.read_u16().unwrap() as usize;
+        if qid_len != wnames.len() {
+            return Err(());
+        }
+
+        for _ in 0..qid_len - 1 {
+            msg.skip(13);
+        }
+
+        let mut qid = QID::new();
+
+        qid.kind = msg.read_u8().unwrap().try_into().unwrap();
+        qid.version = msg.read_u32().unwrap();
+        qid.path = msg.read_u64().unwrap();
+
+        Ok((fid, qid))
     }
 
-    pub fn pending_irq() -> bool {
-        let lock = BLK.acquire();
-        let blk = lock.as_mut();
-        assert!(blk.regs != NonNull::dangling());
-
-        let regs = unsafe { blk.regs.as_mut() };
-        virtio::get_irq_status(regs) != 0
-    }
-
-    pub fn irq_handle() -> Result<(), u8> {
-        let lock = BLK.acquire();
-        let blk = lock.as_mut();
-        assert!(blk.regs != NonNull::dangling());
-        let regs = unsafe { blk.regs.as_mut() };
+    pub fn irq_handle() {
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+        assert!(p9.regs.is_some());
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
         let irq_status = virtio::get_irq_status(regs);
 
         if irq_status & 2 > 0 {
             panic!("device config changed.");
         }
 
-        let used_idx = blk.vq.used_pos as usize % QSIZE;
-        let mut req_status = ReqStatus::OK;
-
-        if blk.vq.used.idx as usize != used_idx {
-            let head = blk.vq.used.ring[used_idx as usize];
-            let req_raw = blk.vq.desc_data[head.id as usize] as *mut Req;
-            let req = unsafe { req_raw.as_ref() }.unwrap();
-            // print!("irq: req after {:?}\n", req);
-            blk.vq.free_desc(head.id as usize);
-            // print!("irq end..\n");
-            blk.vq.used_pos = blk.vq.used_pos.wrapping_add(1);
-            req_status = req.status;
-            let _ = unsafe { Box::from_raw(req_raw) };
-        } else {
-            unreachable!();
-            //???
+        while let Some((_, data)) = p9.q.peek_used() {
+            if data != 0 {
+                //TODO wake
+            }
+            p9.q.pop_used();
         }
-
         virtio::irq_ack(regs, irq_status);
+    }
 
-        if req_status == ReqStatus::OK {
-            Ok(())
-        } else {
-            Err(req_status)
+    pub fn init(regs: &mut Regs) {
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+
+        if p9.regs.is_some() {
+            // TODO
+            return;
         }
+
+        p9.regs = NonNull::new(regs as *mut Regs);
+
+        init_dev_common(regs, 0);
+
+        let status: u32 = regs.read(Regs::STATUS);
+        regs.write(Regs::STATUS, status | Status::DRIVER_OK);
+        dsb!();
+
+        virtio::set_q_len(regs, 0, p9.q.len());
+        virtio::set_used_area(regs, p9.q.used_area_paddr());
+        virtio::set_avail_area(regs, p9.q.avail_area_paddr());
+        virtio::set_desc_area(regs, p9.q.desc_area_paddr());
+        dsb!();
+
+        set_version(p9);
+        attach(p9);
     }
 }

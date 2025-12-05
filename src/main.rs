@@ -10,8 +10,10 @@ use alloc::boxed::Box;
 use crate::{arch::r_sp, stuff::StaticMut};
 
 mod arch;
+mod blk;
 mod heap;
 mod pm;
+mod rng;
 mod spin;
 mod stuff;
 mod timer;
@@ -33,30 +35,39 @@ fn main(b: usize, e: usize) {
     timer::init();
     virtio::init();
 
-    print!(
-        "kernel stack top 0x{:x} bottom 0x{:x} current sp 0x{:x}\n",
-        unsafe { (&_boot_stack) as *const u64 as usize },
-        unsafe { (&_boot_stack_btm) as *const u64 as usize },
-        r_sp()
-    );
-    // arch::pstate_i_clr();
+    let fid = virtio::p9::walk("/main").unwrap();
+    print!("FID = {:?}\n", fid);
 
-    virtio::blk::read_sync(0, BUF.get_mut()).unwrap();
-    for i in 0..512 {
-        let c = BUF.get()[i] as char;
-        print!("{}.", c);
-    }
-    // virtio::blk::write_sync(0, &mut buf).unwrap();
-    // virtio::blk::write_sync(1, &mut buf).unwrap();
-    // virtio::blk::write_sync(2, &mut buf).unwrap();
-    // virtio::blk::write_sync(3, &mut buf).unwrap();
-    // virtio::blk::write_sync(4, &mut buf).unwrap();
-    // virtio::blk::write_sync(5, &mut buf).unwrap();
-    // virtio::blk::write_sync(6, &mut buf).unwrap();
-    // virtio::blk::write_sync(7, &mut buf).unwrap();
-    // virtio::blk::write_sync(8, &mut buf).unwrap();
-    // virtio::blk::write_sync(9, &mut buf).unwrap();
-    // virtio::blk::write_sync(10, &mut buf).unwrap();
+    // print!(
+    //     "kernel stack top 0x{:x} bottom 0x{:x} current sp 0x{:x}\n",
+    //     unsafe { (&_boot_stack) as *const u64 as usize },
+    //     unsafe { (&_boot_stack_btm) as *const u64 as usize },
+    //     r_sp()
+    // );
+
+    // blk::read_sync(0, BUF.get_mut()).unwrap();
+    // blk::read_sync(1, BUF.get_mut()).unwrap();
+    // blk::read_sync(2, BUF.get_mut()).unwrap();
+    // blk::read_sync(3, BUF.get_mut()).unwrap();
+    // blk::read_sync(4, BUF.get_mut()).unwrap();
+    // blk::read_sync(5, BUF.get_mut()).unwrap();
+    // blk::read_sync(6, BUF.get_mut()).unwrap();
+    // blk::read_sync(7, BUF.get_mut()).unwrap();
+    // blk::read_sync(8, BUF.get_mut()).unwrap();
+    // blk::read_sync(10, BUF.get_mut()).unwrap();
+    // blk::read_sync(0, BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+    // rng::read_sync(BUF.get_mut()).unwrap();
+
+    // for i in 0..512 {
+    //     print!("{} ", BUF.get()[i] as char);
+    // }
 
     loop {
         wfi!();

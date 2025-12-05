@@ -61,7 +61,7 @@ SECTIONS {
     {
         . = ALIGN(4096);
         _boot_stack_btm = .;
-        . += 32768;
+        . += (65536);
         _boot_stack = .;
         *(.bss.*)
         *(.bss)

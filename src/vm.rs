@@ -2,7 +2,9 @@ use crate::{
     arch::{self, tlbi_vaee1},
     dsb, isb,
     pm::{GB, KB, MB},
-    print, tlbi_vmalle1,
+    print,
+    stuff::BitSet128,
+    tlbi_vmalle1,
 };
 use core::{arch::asm, cell::UnsafeCell, ptr::slice_from_raw_parts_mut};
 use core::{cell::OnceCell, fmt::Display, hash::Hash, ptr::NonNull};
@@ -306,7 +308,7 @@ impl Display for Vaddr {
 
 pub struct Region {
     start: usize,
-    bits: u64,
+    bs: BitSet128,
     nxt: Option<NonNull<Region>>,
 }
 
@@ -316,18 +318,18 @@ impl Region {
     const fn new(start: usize) -> Region {
         Region {
             start,
-            bits: 0,
+            bs: BitSet128::new(128),
             nxt: None,
         }
     }
 
     fn is_full(&self) -> bool {
-        self.bits == !0u64
+        self.bs.full()
     }
 
-    fn is_uninit(&self) -> bool {
-        self.start == 0 && self.nxt.is_none() && self.bits == 0
-    }
+    // fn is_uninit(&self) -> bool {
+    //     self.start == 0 && self.nxt.is_none() && self.bits == 0
+    // }
 
     fn nxt(&self) -> Option<NonNull<Region>> {
         match self.nxt {
@@ -345,64 +347,51 @@ impl Region {
     }
 
     fn alloc(&mut self, n: usize) -> Option<usize> {
-        if self.is_full() || self.is_uninit() {
+        if self.is_full() || n != 1 {
             // TODO append if full
             return None;
         }
 
-        if self.bits.count_zeros() < n as u32 {
-            // TODO append if full
-            return None;
-        }
-
-        let mut found = 0;
-
-        let mut bits = self.bits;
-        let mut tmp_bits = self.bits;
-        for i in 0..64 {
-            if (bits & 1) == 0 {
-                tmp_bits |= 1u64 << i;
-                found += 1;
-
-                if found == n {
-                    self.bits = tmp_bits;
-                    return Some(self.start + (i - (n - 1)) * 4 * KB);
-                }
-            } else {
-                found = 0;
+        match self.bs.first_clr() {
+            Some(i) => {
+                self.bs.set(i);
+                Some(i as usize * 4096 + self.start)
             }
-            bits >>= 1;
+            _ => None,
         }
-
-        None
     }
 
     fn free_inner(&mut self, addr: usize) -> Option<()> {
-        if addr >= self.start && addr < (self.start + 64 * 4 * KB) {
+        if addr >= self.start {
             let addr = addr - self.start;
-            let bit = addr / (4 * KB);
-            assert!((self.bits & (1u64 << bit)) != 0);
-            self.bits &= !(1u64 << bit);
+            let bit = addr / (4096);
+
+            if bit >= 128 {
+                return None;
+            }
+
+            assert!(self.bs.tst(bit as u8));
+            self.bs.set(bit as u8);
             Some(())
         } else {
             None
         }
     }
 
-    #[unsafe(no_mangle)]
     pub fn free_1(&mut self, addr: usize) {
         if self.free_inner(addr).is_some() {
             return;
         }
 
-        let mut last = self;
-        while let Some(mut nxt) = last.nxt() {
-            let tmp = unsafe { nxt.as_mut() };
-            if let Some(_) = tmp.free_inner(addr) {
-                return;
-            }
-            last = tmp;
-        }
+        // let mut last = self;
+        // while let Some(mut nxt) = last.nxt() {
+        //     let tmp = unsafe { nxt.as_mut() };
+        //     if let Some(_) = tmp.free_inner(addr) {
+        //         return;
+        //     }
+        //     last = tmp;
+        // }
+        print!("addr: 0x{:x} self.start: 0x{:x}\n", addr, self.start);
         unreachable!()
     }
 }

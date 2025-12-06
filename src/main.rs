@@ -3,11 +3,12 @@
 
 extern crate alloc;
 
-use core::arch::{asm, naked_asm};
+use core::{
+    arch::{asm, naked_asm},
+    cell::UnsafeCell,
+};
 
-use alloc::boxed::Box;
-
-use crate::{arch::r_sp, stuff::StaticMut};
+use crate::{heap::SyncUnsafeCell, virtio::p9};
 
 mod arch;
 mod blk;
@@ -22,21 +23,38 @@ mod uart;
 mod virtio;
 mod vm;
 
-static BUF: StaticMut<[u8; 512]> = StaticMut::new([0; 512]);
+static BUF: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell(UnsafeCell::new([0; 512]));
 
 #[unsafe(no_mangle)]
 fn main(b: usize, e: usize) {
     pm::init(b, e);
     vm::init(b, e);
-    heap::init();
     uart::init_tx();
+    heap::init();
     trap::init();
     uart::init_rx();
     timer::init();
+    // arch::pstate_i_clr();
     virtio::init();
 
-    let fid = virtio::p9::walk("/main").unwrap();
-    print!("FID = {:?}\n", fid);
+    let (fid, _) = virtio::p9::walk("/disas.txt").unwrap();
+    // print!("FID = {:?}\n", fid);
+    let qid = virtio::p9::open(fid, p9::O::RDWR as u32).unwrap();
+    print!("QID = {:?}\n", qid);
+    let n = p9::write(fid, "12345678910\n".as_bytes(), 0).unwrap();
+    print!("N = {}\n", n);
+    let n = p9::write(fid, "qweertyuiop".as_bytes(), 11).unwrap();
+    print!("N = {}\n", n);
+
+    // p9::remove(fid).unwrap();
+    // p9::clunk(fid).unwrap();
+    // p9::create(fid, "foxx", 0, p9::O::RDWR as u32, 1000).unwrap();
+    // p9::mkdir(fid, "foxxx", p9::O::RDWR as u32, 1000).unwrap();
+    // let n = p9::write(fid, "chapa ilale".as_bytes(), 0).unwrap();
+    // print!("N = {}\n", n);
+    let buf = unsafe { BUF.0.get().as_mut() }.unwrap();
+    let n = p9::readdir(fid, buf, 0).unwrap();
+    print!("N = {}\n", n);
 
     // print!(
     //     "kernel stack top 0x{:x} bottom 0x{:x} current sp 0x{:x}\n",
@@ -65,9 +83,9 @@ fn main(b: usize, e: usize) {
     // rng::read_sync(BUF.get_mut()).unwrap();
     // rng::read_sync(BUF.get_mut()).unwrap();
 
-    // for i in 0..512 {
-    //     print!("{} ", BUF.get()[i] as char);
-    // }
+    for i in 0..n as usize {
+        print!("{}", buf[i] as char);
+    }
 
     loop {
         wfi!();

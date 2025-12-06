@@ -22,7 +22,10 @@ struct Page {
     ref_cnt: usize,
     ord: usize,
     next: Option<NonNull<Page>>,
+    magic: u64,
 }
+
+const MAGIC: u64 = 0xDEADBEEFCAFEBABE;
 
 impl Page {
     pub const fn new(idx: usize, ord: usize, rc: usize) -> Page {
@@ -31,6 +34,13 @@ impl Page {
             ref_cnt: rc,
             ord,
             next: None,
+            magic: MAGIC,
+        }
+    }
+
+    fn assert_ok(&self) {
+        if self.magic != MAGIC {
+            panic!("wrong magic")
         }
     }
 
@@ -48,6 +58,8 @@ impl Page {
         let ptr2 = unsafe { a.page_ptr.add(p_idx_2) };
         let ptr1_r = unsafe { ptr1.as_mut() }.unwrap();
         let ptr2_r = unsafe { ptr2.as_mut() }.unwrap();
+        ptr2_r.assert_ok();
+        ptr1_r.assert_ok();
         assert!(ptr1_r.idx == p_idx_1);
         assert!(ptr2_r.idx == p_idx_2);
         ptr1_r.ord = order + 1;
@@ -90,6 +102,7 @@ impl Default for Page {
             ref_cnt: 0,
             ord: 0,
             next: None,
+            magic: MAGIC,
         }
     }
 }
@@ -267,6 +280,7 @@ impl Allocator {
 
         if let Some(p) = self.free_lists[ord].rm_first() {
             let p = unsafe { p.as_mut() }.unwrap();
+            p.assert_ok();
             p.ref_cnt += 1;
             p.rm_links();
             return Some((p.idx * 4096) as *mut u8);
@@ -279,7 +293,9 @@ impl Allocator {
         let mut i = ord - 1;
         loop {
             if let Some(p) = self.free_lists[i].get_head() {
-                self.split_to(unsafe { p.as_mut().unwrap() }, i, ord);
+                let p = unsafe { p.as_mut().unwrap() };
+                p.assert_ok();
+                self.split_to(p, i, ord);
                 break;
             }
             if i == 0 {
@@ -290,6 +306,7 @@ impl Allocator {
 
         if let Some(p) = self.free_lists[ord].rm_first() {
             let p = unsafe { p.as_mut() }.unwrap();
+            p.assert_ok();
             p.ref_cnt += 1;
             p.rm_links();
             return Some((p.idx * 4096) as *mut u8);
@@ -314,6 +331,7 @@ impl Allocator {
         assert!(addr < self.size);
         let idx = addr / 4096;
         let page = unsafe { self.page_ptr.add(idx).as_mut() }.unwrap();
+        page.assert_ok();
         assert!(page.next.is_none());
         page.ref_cnt -= 1;
         if page.ref_cnt > 0 {
@@ -341,4 +359,14 @@ pub fn init(k_begin: usize, k_end: usize) {
 pub fn free_low(k_begin: usize) {
     let lock = ALLOC.acquire();
     lock.as_mut().init_free_list2(k_begin);
+}
+
+pub fn print_fl() {
+    let lock = ALLOC.acquire();
+    let a = lock.as_ref();
+
+    for i in 0..a.free_lists.len() {
+        print!("++++++++++++++++++++++++++++++ {}\n", i);
+        a.free_lists[i].print_list();
+    }
 }

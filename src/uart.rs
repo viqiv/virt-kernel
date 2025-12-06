@@ -1,6 +1,8 @@
-use crate::{stuff::StaticMut, trap::gic_enable_intr, vm};
+use core::cell::UnsafeCell;
 
-static MAP: StaticMut<usize> = StaticMut::new(0);
+use crate::{heap::SyncUnsafeCell, trap::gic_enable_intr, vm};
+
+static MAP: SyncUnsafeCell<usize> = SyncUnsafeCell(UnsafeCell::new(0));
 
 // static LOCK: spin::Lock<()> = spin::Lock::new("uart", ());
 
@@ -20,7 +22,7 @@ pub struct Writer;
 
 impl core::fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        write_bytes(s.as_bytes(), *MAP);
+        write_bytes(s.as_bytes(), unsafe { MAP.0.get().read() });
         Ok(())
     }
 }
@@ -35,12 +37,12 @@ macro_rules! print {
 
 pub fn init_tx() {
     let v = vm::map_4k(0x9000000).unwrap();
-    *MAP.get_mut() = v;
+    unsafe { MAP.0.get().write(v) };
     enable_tx(v);
 }
 
 pub fn init_rx() {
-    enable_rx(*MAP);
+    enable_rx(unsafe { MAP.0.get().read() });
 }
 
 pub fn enable_rx(map: usize) {
@@ -64,7 +66,7 @@ pub fn enable_tx(map: usize) {
 }
 
 fn clr_rx() {
-    let base = ((*MAP) + 0x44) as *mut u32;
+    let base = (unsafe { MAP.0.get().read() } + 0x44) as *mut u32;
     unsafe {
         let cr = 1u32 << 4;
         base.write_volatile(cr);
@@ -72,7 +74,7 @@ fn clr_rx() {
 }
 
 fn read() -> u8 {
-    let dr = (*MAP) as *const u8;
+    let dr = (unsafe { MAP.0.get().read() }) as *const u8;
     unsafe { *dr }
 }
 

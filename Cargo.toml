@@ -8,7 +8,9 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-
+debug = "full"
+strip = false
+opt-level = "z"
 
 [dependencies]
 linked_list_allocator = "0.10.5"

@@ -3,49 +3,6 @@ use core::{
     ops::{Deref, DerefMut},
 };
 
-use crate::print;
-
-pub struct StaticMut<T> {
-    data: UnsafeCell<T>,
-}
-
-unsafe impl<T> Sync for StaticMut<T> {}
-
-impl<T> StaticMut<T> {
-    pub const fn new(data: T) -> StaticMut<T> {
-        StaticMut {
-            data: UnsafeCell::new(data),
-        }
-    }
-
-    pub fn get(&self) -> &T {
-        unsafe { self.data.get().as_ref() }.unwrap()
-    }
-
-    pub fn set(&self, v: T) {
-        unsafe {
-            self.data.get().write(v);
-        }
-    }
-
-    pub fn get_mut(&self) -> &mut T {
-        unsafe { self.data.get().as_mut() }.unwrap()
-    }
-}
-
-impl<T> Deref for StaticMut<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        self.get()
-    }
-}
-
-impl<T> DerefMut for StaticMut<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.get_mut()
-    }
-}
-
 pub struct BitSet128 {
     back: u128,
     len: u8,

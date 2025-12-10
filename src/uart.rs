@@ -36,7 +36,7 @@ macro_rules! print {
 }
 
 pub fn init_tx() {
-    let v = vm::map_4k(0x9000000).unwrap();
+    let v = vm::map_4k(0x9000000, vm::PR_PW).unwrap();
     unsafe { MAP.0.get().write(v) };
     enable_tx(v);
 }

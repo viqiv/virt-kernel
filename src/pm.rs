@@ -315,9 +315,9 @@ impl Allocator {
         }
     }
 
-    fn alloc(&mut self, n: usize) -> Option<*mut u8> {
+    fn alloc(&mut self, n: usize) -> Option<usize> {
         match self._alloc(n) {
-            Some(n) => Some((n as usize + self.offt) as *mut u8),
+            Some(n) => Some((n as usize + self.offt)),
             None => None,
         }
     }
@@ -341,7 +341,7 @@ impl Allocator {
     }
 }
 
-pub fn alloc(n: usize) -> Option<*mut u8> {
+pub fn alloc(n: usize) -> Option<usize> {
     let lock = ALLOC.acquire();
     lock.as_mut().alloc(n)
 }

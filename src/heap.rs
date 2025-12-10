@@ -9,6 +9,19 @@ static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 #[repr(transparent)]
 pub struct SyncUnsafeCell<T>(pub UnsafeCell<T>);
+impl<T> SyncUnsafeCell<T> {
+    pub const fn new(v: T) -> SyncUnsafeCell<T> {
+        SyncUnsafeCell(UnsafeCell::new(v))
+    }
+
+    pub fn as_mut(&self) -> &mut T {
+        unsafe { self.0.get().as_mut() }.unwrap()
+    }
+
+    pub fn as_ref(&self) -> &T {
+        unsafe { self.0.get().as_ref() }.unwrap()
+    }
+}
 
 unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
 

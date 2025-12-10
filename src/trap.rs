@@ -1,5 +1,9 @@
 use crate::{
-    _boot_stack, _boot_stack_btm, arch, heap::SyncUnsafeCell, print, timer, uart, vm::map_4k, wfi,
+    _boot_stack, _boot_stack_btm, arch,
+    heap::SyncUnsafeCell,
+    p9, print, timer, uart,
+    vm::{self, map_4k},
+    wfi,
 };
 use core::{
     arch::{asm, naked_asm},
@@ -9,17 +13,20 @@ use core::{
 #[derive(Debug)]
 #[repr(C)]
 pub struct Frame {
-    pc: u64,
-    pstate: u64,
+    pub pc: u64,
+    pub sp_el0: u64,
+    pub pstate: u64,
     regs: [u64; 31],
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn irq_handler(frame: &Frame) {
     let idx = gic_ack();
+    gic_eoi(idx);
     match idx {
         30 => timer::handle_tik(),
         33 => uart::handle_rx(),
+        78 => p9::irq_handle(),
         _ => {
             print!("unhandled irq: {}\n", idx);
             loop {
@@ -27,7 +34,6 @@ pub extern "C" fn irq_handler(frame: &Frame) {
             }
         }
     };
-    gic_eoi(idx);
 }
 
 #[unsafe(no_mangle)]
@@ -42,7 +48,7 @@ pub extern "C" fn sync_handler(frame: &Frame) {
     let btm = unsafe { (&_boot_stack_btm) as *const u64 as u64 };
     let depth = sp.wrapping_sub(btm);
     print!("kernel stack overflow =  {} depth: {}\n", sp <= btm, depth);
-    // print!("{:?}\n", frame);
+    print!("{:?}\n", frame);
     loop {
         wfi!();
     }
@@ -71,11 +77,13 @@ pub extern "C" fn _sync_handler() {
         "mrs x0, spsr_el1",
         "stp x0, x30, [sp, #-16]!",
         "mrs x0, elr_el1",
-        "str x0, [sp, #-8]!",
+        "mrs x1, sp_el0",
+        "stp x0, x1, [sp, #-16]!",
         "mov x0, sp",
         "bl sync_handler",
-        "ldr x0, [sp], #8",
+        "ldp x0, x1, [sp], #16",
         "msr elr_el1, x0",
+        "msr sp_el0, x1",
         "ldp x0, x30, [sp], #16",
         "msr spsr_el1, x0",
         "ldp x29, x28, [sp], #16",
@@ -120,11 +128,13 @@ pub extern "C" fn _irq_handler() {
         "mrs x0, spsr_el1",
         "stp x0, x30, [sp, #-16]!",
         "mrs x0, elr_el1",
-        "str x0, [sp, #-8]!",
+        "mrs x1, sp_el0",
+        "stp x0, x1, [sp, #-16]!",
         "mov x0, sp",
         "bl irq_handler",
-        "ldr x0, [sp], #8",
+        "ldp x0, x1, [sp], #16",
         "msr elr_el1, x0",
+        "msr sp_el0, x1",
         "ldp x0, x30, [sp], #16",
         "msr spsr_el1, x0",
         "ldp x29, x28, [sp], #16",
@@ -159,6 +169,20 @@ pub extern "C" fn _other_handler() {
 #[unsafe(link_section = ".text.vector")]
 pub extern "C" fn trap_vector() {
     naked_asm!(
+        "b _sync_handler",
+        ".rep 31",
+        "nop",
+        ".endr",
+        "b _irq_handler",
+        ".rep 31",
+        "nop",
+        ".endr",
+        "b _other_handler",
+        ".rep 31",
+        "nop",
+        ".endr",
+        "b _other_handler",
+        ".align 8", //el0
         "b _sync_handler",
         ".rep 31",
         "nop",
@@ -242,9 +266,9 @@ pub fn gic_disable_intr(idx: usize) {
 }
 
 pub fn init() {
-    let map = map_4k(0x8000000).unwrap();
+    let map = map_4k(0x8000000, vm::PR_PW).unwrap();
     unsafe { GIC_DIST.0.get().write(map) };
-    let map = map_4k(0x8010000).unwrap();
+    let map = map_4k(0x8010000, vm::PR_PW).unwrap();
     unsafe { GIC_CPU.0.get().write(map) };
     gic_enable();
 }

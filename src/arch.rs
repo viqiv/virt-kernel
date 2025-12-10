@@ -249,6 +249,13 @@ macro_rules! wfi {
 }
 
 #[macro_export]
+macro_rules! wfe {
+    () => {
+        unsafe { asm!("wfe") }
+    };
+}
+
+#[macro_export]
 macro_rules! udf {
     () => {
         unsafe { asm!("udf #0") }

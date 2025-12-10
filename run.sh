@@ -12,7 +12,7 @@ qemu-system-aarch64 \
     -drive file=/home/m/Desktop/raspi.img,if=none,id=hd0,format=raw \
     -device virtio-blk-device,drive=hd0 \
     -global virtio-mmio.force-legacy=false \
-    #-S -s
+    # -S -s
 
 
 # (qemu) info mtree

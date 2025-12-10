@@ -1,6 +1,6 @@
 use core::arch::asm;
 
-use crate::{print, trap};
+use crate::{print, sched, trap};
 
 #[allow(unused)]
 #[inline]
@@ -75,4 +75,6 @@ pub fn handle_tik() {
     let freq = r_freq();
     print!("tik... {:x}\n", freq);
     w_ptval_el0(freq / 10);
+
+    // sched::yild();
 }

@@ -39,32 +39,42 @@ SECTIONS {
         KEEP(*(.text.vector));
     }
     
-
     .text ALIGN(4K) : 
         AT(ADDR(.text) - 0xffff000000000000) 
         {
         *(.text)
         *(.text.*)
+        _text_end = .;
     }
 
     .data : AT(ADDR(.data) - 0xffff000000000000) {
         *(.data)
         *(.data.*)
+        _data_end = .;
     }
 
     .rodata : AT(ADDR(.rodata) - 0xffff000000000000) {
         *(.rodata)
         *(.rodata.*)
+        _rodata_end = .;
     }
 
     .bss : AT(ADDR(.bss) - 0xffff000000000000) 
     {
         . = ALIGN(4096);
         _boot_stack_btm = .;
-        . += (4096);
+        . += (4096*8);
         _boot_stack = .;
         *(.bss.*)
         *(.bss)
+        _bss_end = .;
+    }
+    
+    .user ALIGN(4K) :
+        AT(ADDR(.user) - 0xffff000000000000) 
+         {
+        KEEP(*(.user));
+        _user_end = .;
     }
 
     _kernel_end = . - 0xffff000000000000;

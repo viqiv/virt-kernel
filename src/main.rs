@@ -8,13 +8,18 @@ use core::{
     cell::UnsafeCell,
 };
 
-use crate::{heap::SyncUnsafeCell, virtio::p9};
+use alloc::vec::Vec;
+
+use crate::{arch::pstate_i_clr, heap::SyncUnsafeCell, sched::mycpu};
 
 mod arch;
 mod blk;
+mod elf;
 mod heap;
+mod p9;
 mod pm;
 mod rng;
+mod sched;
 mod spin;
 mod stuff;
 mod timer;
@@ -25,6 +30,20 @@ mod vm;
 
 static BUF: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell(UnsafeCell::new([0; 512]));
 
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".user")]
+#[allow(unused)]
+extern "C" fn task() {
+    naked_asm!("b .");
+    // let mut i = 0;
+    // loop {
+    // print!("...task {}\n", i);
+    // pstate_i_clr();
+    // i += 1;
+    // }
+}
+
 #[unsafe(no_mangle)]
 fn main(b: usize, e: usize) {
     pm::init(b, e);
@@ -33,18 +52,24 @@ fn main(b: usize, e: usize) {
     heap::init();
     trap::init();
     uart::init_rx();
-    timer::init();
+    // timer::init();
     // arch::pstate_i_clr();
+    print!("bEGIN: {:x} End: {:x}\n", b, e);
     virtio::init();
 
-    let (fid, _) = virtio::p9::walk("/disas.txt").unwrap();
+    sched::create_task(task as *const fn() as u64);
+    sched::scheduler();
+
+    // let (fid, _) = p9::walk("/fox").unwrap();
     // print!("FID = {:?}\n", fid);
-    let qid = virtio::p9::open(fid, p9::O::RDWR as u32).unwrap();
-    print!("QID = {:?}\n", qid);
-    let n = p9::write(fid, "12345678910\n".as_bytes(), 0).unwrap();
-    print!("N = {}\n", n);
-    let n = p9::write(fid, "qweertyuiop".as_bytes(), 11).unwrap();
-    print!("N = {}\n", n);
+    // let (fid, _) = p9::walk("/main.o").unwrap();
+    // print!("FID = {:?}\n", fid);
+    // let qid = virtio::p9::open(fid, p9::O::RDWR as u32).unwrap();
+    // print!("QID = {:?}\n", qid);
+    // let n = p9::write(fid, "12345678910\n".as_bytes(), 0).unwrap();
+    // print!("N = {}\n", n);
+    // let n = p9::write(fid, "qweertyuiop".as_bytes(), 11).unwrap();
+    // print!("N = {}\n", n);
 
     // p9::remove(fid).unwrap();
     // p9::clunk(fid).unwrap();
@@ -52,9 +77,11 @@ fn main(b: usize, e: usize) {
     // p9::mkdir(fid, "foxxx", p9::O::RDWR as u32, 1000).unwrap();
     // let n = p9::write(fid, "chapa ilale".as_bytes(), 0).unwrap();
     // print!("N = {}\n", n);
-    let buf = unsafe { BUF.0.get().as_mut() }.unwrap();
-    let n = p9::readdir(fid, buf, 0).unwrap();
-    print!("N = {}\n", n);
+
+    // arch::pstate_i_clr();
+    // let buf = unsafe { BUF.0.get().as_mut() }.unwrap();
+    // let n = p9::stat(0, false);
+    // print!("N = {:?}\n", n);
 
     // print!(
     //     "kernel stack top 0x{:x} bottom 0x{:x} current sp 0x{:x}\n",
@@ -83,9 +110,9 @@ fn main(b: usize, e: usize) {
     // rng::read_sync(BUF.get_mut()).unwrap();
     // rng::read_sync(BUF.get_mut()).unwrap();
 
-    for i in 0..n as usize {
-        print!("{}", buf[i] as char);
-    }
+    // for i in 0..n as usize {
+    //     print!("{}", buf[i] as char);
+    // }
 
     loop {
         wfi!();
@@ -98,6 +125,12 @@ unsafe extern "C" {
     pub static _trap_vec: u64;
     pub static _kernel_begin: u64;
     pub static _kernel_end: u64;
+
+    pub static _text_end: u64;
+    pub static _data_end: u64;
+    pub static _rodata_end: u64;
+    pub static _bss_end: u64;
+    pub static _user_end: u64;
 }
 
 #[unsafe(no_mangle)]
@@ -166,7 +199,7 @@ pub extern "C" fn _start() {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    print!("{}\n", info);
+    print!("{}", info);
     loop {
         wfi!();
     }

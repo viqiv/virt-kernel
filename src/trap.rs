@@ -16,7 +16,7 @@ pub struct Frame {
     pub pc: u64,
     pub sp_el0: u64,
     pub pstate: u64,
-    regs: [u64; 31],
+    pub regs: [u64; 31],
 }
 
 #[unsafe(no_mangle)]

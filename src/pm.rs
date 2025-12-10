@@ -332,7 +332,7 @@ impl Allocator {
         let idx = addr / 4096;
         let page = unsafe { self.page_ptr.add(idx).as_mut() }.unwrap();
         page.assert_ok();
-        assert!(page.next.is_none());
+        assert!(page.ref_cnt > 0);
         page.ref_cnt -= 1;
         if page.ref_cnt > 0 {
             return;

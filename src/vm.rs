@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 
 use crate::{
-    _bss_end, _data_end, _rodata_end, _text_end, _user_end,
+    _bss_end, _data_end, _kernel_end, _rodata_end, _text_end, _user_end,
     arch::{self, tlbi_vaee1},
     dsb, isb,
     pm::{GB, KB, MB},
@@ -108,6 +108,14 @@ fn zero_pt(ptr: *mut u64) {
     for i in 0..512 {
         unsafe { ptr.add(i).write(0) }
     }
+}
+
+pub fn zero_phys_pt(pt: u64) {
+    let ptr = wrap(pt as usize) as *mut u64;
+    for i in 0..512 {
+        unsafe { ptr.add(i).write(0) }
+    }
+    free_4k_direct(ptr as usize);
 }
 
 fn pt_alloc_if_0(idx: usize, pt: &mut [u64]) -> &mut [u64] {
@@ -252,7 +260,10 @@ fn use_4k_blocks(l0_pt: &mut [u64], mut k_begin: usize, mut k_end: usize) {
 }
 
 #[derive(Debug)]
-pub struct Error;
+pub enum Error {
+    Exists,
+    Alloc,
+}
 
 pub fn map_v2p_4k_inner(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let vaddr = Vaddr::new(v);
@@ -263,7 +274,7 @@ pub fn map_v2p_4k_inner(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Re
     let l3_pt = pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt);
 
     if l3_pt[vaddr.l3() as usize] != 0 {
-        return Err(Error {});
+        return Err(Error::Exists);
     }
 
     l3_pt[vaddr.l3() as usize] = (p as u64 | perms | 0x403) as u64;
@@ -290,12 +301,16 @@ fn map_v2p_4k(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     // let l2_pt = pt_alloc_if_0_2(vaddr.l1() as usize, l1_pt);
     // let l2_pt_w = l2_pt.as_ptr();
     // let l3_pt = pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt);
+    // if l3_pt[vaddr.l3() as usize] != 0 {
+    //     return Err(Error::Exists);
+    // }
     // l3_pt[vaddr.l3() as usize] = (p as u64 | perms | 0x403) as u64;
 
     // free_4k_direct(l1_pt_w as usize);
     // free_4k_direct(l2_pt_w as usize);
     // free_4k_direct(l3_pt.as_ptr() as usize);
 
+    // tlbi_vaee1(v as u64);
     // Ok(v)
 }
 
@@ -341,6 +356,74 @@ pub fn v2p(v: usize) -> Option<usize> {
     free_4k_direct(l3_pt as usize);
 
     Some((paddr as usize & PHY_MASK) | (v & 0xfff))
+}
+
+pub fn unmap_4k(v: usize) -> Result<(), ()> {
+    let pt_lock = PT.acquire();
+    let l0_pt = &mut pt_lock.as_mut().data;
+
+    let vaddr = Vaddr::new(v);
+
+    let l1_pt = l0_pt[vaddr.l0() as usize];
+
+    if l1_pt == 0 {
+        return Err(());
+    }
+
+    let l1_pt = wrap(l1_pt as usize & PHY_MASK) as *const u64;
+    let l2_pt = unsafe { *l1_pt.add(vaddr.l1() as usize) };
+
+    if l2_pt == 0 {
+        return Err(());
+    }
+
+    let l2_pt = wrap(l2_pt as usize & PHY_MASK) as *const u64;
+    let l3_pt = unsafe { *l2_pt.add(vaddr.l2() as usize) };
+
+    if l3_pt == 0 {
+        return Err(());
+    }
+
+    let l3_pt = wrap(l3_pt as usize & PHY_MASK) as *mut u64;
+    unsafe { *l3_pt.add(vaddr.l3() as usize) = 0 };
+
+    free_4k_direct(l1_pt as usize);
+    free_4k_direct(l2_pt as usize);
+    free_4k_direct(l3_pt as usize);
+
+    tlbi_vaee1(v as u64);
+    Ok(())
+}
+
+fn free_walk(pt: &[u64], level: u8) {
+    assert!(pt.len() == 512);
+    if level < 3 {
+        for i in 0..pt.len() {
+            let paddr = pt[i] & PHY_MASK as u64;
+            //HARDcoDE
+            if paddr >= 0x40000000 {
+                let pt = pt_from_u64!(paddr);
+                free_walk(pt, level + 1);
+                free_4k_direct(pt.as_ptr() as usize);
+                pm::free(paddr as *mut u8);
+            }
+        }
+    } else {
+        for i in 0..pt.len() {
+            let paddr = pt[i] & PHY_MASK as u64;
+
+            //HARDcoDE
+            if paddr >= 0x40000000 && (pt[i] & 3) > 0 {
+                pm::free(paddr as *mut u8);
+            }
+        }
+    }
+}
+
+pub fn free_pt(pt: u64) {
+    let pt = pt_from_u64!(pt);
+    free_walk(pt, 0);
+    free_4k_direct(pt.as_ptr() as usize);
 }
 
 pub fn init(k_begin: usize, k_end: usize) {
@@ -489,9 +572,8 @@ impl Region {
                 return None;
             }
 
-            tlbi_vaee1(addr as u64);
             assert!(self.bs.tst(bit as u8));
-            self.bs.set(bit as u8);
+            self.bs.clr(bit as u8);
             Some(())
         } else {
             None
@@ -540,15 +622,15 @@ pub fn alloc(n: usize) -> Option<usize> {
 }
 
 pub fn free(addr: usize, n: usize) {
-    let lock = REGIONS.acquire();
     for i in 0..n {
-        lock.as_mut().free_1(addr + (i * 4 * KB));
+        free_4k(addr + (i * 4 * KB));
     }
 }
 
 pub fn free_4k(v: usize) {
     let lock = REGIONS.acquire();
-    lock.as_mut().free_1(v)
+    lock.as_mut().free_1(v);
+    unmap_4k(v).unwrap();
 }
 
 pub fn alloc_4k_direct() -> Option<usize> {
@@ -564,7 +646,7 @@ pub fn free_4k_direct(v: usize) {
 pub fn map_4k(p: usize, perms: u64) -> Result<usize, Error> {
     match alloc_4k() {
         Some(v) => map_v2p_4k(v, p, perms),
-        _ => Err(Error),
+        _ => Err(Error::Alloc),
     }
 }
 
@@ -576,7 +658,7 @@ pub fn map(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
             }
             Ok(v)
         }
-        _ => Err(Error),
+        _ => Err(Error::Alloc),
     }
 }
 
@@ -588,6 +670,6 @@ pub fn map2(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
             }
             Ok(v)
         }
-        _ => Err(Error),
+        _ => Err(Error::Alloc),
     }
 }

@@ -15,6 +15,7 @@ use crate::{arch::pstate_i_clr, heap::SyncUnsafeCell, sched::mycpu};
 mod arch;
 mod blk;
 mod elf;
+mod fs;
 mod heap;
 mod p9;
 mod pm;

@@ -1,10 +1,13 @@
 use core::{
     arch::{asm, naked_asm},
+    cmp::min,
     hint::spin_loop,
     mem::forget,
     ptr::slice_from_raw_parts_mut,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+use alloc::{collections::vec_deque::VecDeque, vec::Vec};
 
 use crate::{
     arch::{
@@ -12,15 +15,16 @@ use crate::{
         w_ttbr0_el1,
     },
     dsb,
+    elf::{self, Elf, Elf64Phdr, PhIter},
+    fs::{self, File, open},
     heap::SyncUnsafeCell,
-    isb,
-    p9::{self, open},
-    pm::{self, GB},
+    isb, p9,
+    pm::{self, GB, align_b, align_f},
     print, pt_from_u64,
     spin::Lock,
-    stuff::BitSet128,
+    stuff::{BitSet128, as_slice_mut, cstr_as_slice, defer},
     trap,
-    vm::{self, Vaddr, map_v2p_4k_inner, wrap},
+    vm::{self, Vaddr, free_pt, map_v2p_4k_inner, wrap, zero_phys_pt},
     wfe, wfi,
 };
 
@@ -126,9 +130,13 @@ impl Task {
         }
     }
 
+    fn alloc(&mut self, vfrom: usize, mut len: usize) {}
+
     fn init_1(&mut self, pc: u64) {
         self.user_pt = Some(pm::alloc(4096).unwrap() as u64);
+        zero_phys_pt(self.user_pt.unwrap());
 
+        // writable by all
         let sp_el0 = pm::alloc(4096).unwrap();
         self.map(GB - 4096, sp_el0, vm::PR_PW_UR_UW1).unwrap();
         let sp_el0 = GB;
@@ -148,6 +156,207 @@ impl Task {
 
         self.trapframe = tf_ptr as u64;
     }
+}
+
+pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), ()> {
+    let task = mycpu().get_task().unwrap();
+
+    let old_user_pt = task.user_pt.unwrap();
+
+    let new_user_pt = if let Some(p) = pm::alloc(4096) {
+        p
+    } else {
+        return Err(());
+    } as u64;
+
+    zero_phys_pt(new_user_pt);
+
+    task.user_pt = Some(new_user_pt);
+    restore_ttbr0(task.pid as usize, new_user_pt as usize);
+
+    if let Some(new_user_sp) = pm::alloc(4096) {
+        if let Err(_) = task.map(GB - 4096, new_user_sp, vm::PR_PW_UR_UW1) {
+            pm::free(new_user_sp as *mut u8);
+            task.user_pt = Some(old_user_pt);
+            restore_ttbr0(task.pid as usize, old_user_pt as usize);
+            return Err(());
+        }
+    } else {
+        task.user_pt = Some(old_user_pt);
+        restore_ttbr0(task.pid as usize, old_user_pt as usize);
+        return Err(());
+    }
+
+    let mut elf = if let Ok(elf) = Elf::new(path) {
+        elf
+    } else {
+        free_pt(new_user_pt);
+        task.user_pt = Some(old_user_pt);
+        restore_ttbr0(task.pid as usize, old_user_pt as usize);
+        return Err(());
+    };
+
+    let file = unsafe { (elf.file as *mut File).as_mut() }.unwrap();
+    let mut phit = PhIter::new(&mut elf);
+    let mut ph = Elf64Phdr::zeroed();
+    let mut error = false;
+    while let Some(p) = phit.next((&mut ph) as *mut Elf64Phdr) {
+        if error {
+            break;
+        }
+
+        if p.kind as u64 != elf::PT_LOAD {
+            continue;
+        }
+        let len = align_f((p.vaddr as usize % 4096) + p.memsz as usize, 4096);
+        let vfrom = align_b(p.vaddr as usize, 4096);
+
+        let pages = len / 4096;
+        let mut wofft = p.vaddr;
+        for i in 0..pages {
+            let pm = pm::alloc(4096).unwrap();
+            if let Err(_) = task.map(
+                vfrom + i * 4096,
+                pm,
+                if p.flags == elf::PF_R | elf::PF_X {
+                    vm::PR_UR_UX
+                } else if p.flags == elf::PF_R | elf::PF_W {
+                    vm::PR_PW_UR_UW1
+                } else if p.flags == elf::PF_R {
+                    vm::PR_UR
+                } else {
+                    error = true;
+                    break;
+                },
+            ) {
+                pm::free(pm as *mut u8);
+                error = true;
+                break;
+            }
+
+            if let Ok(vm) = vm::map(pm, 1, vm::PR_PW) {
+                let buf_offt = wofft as usize % 4096;
+                let written = wofft - p.vaddr;
+                let buf = as_slice_mut(
+                    (vm + buf_offt) as *mut u8, //
+                    min(4096 - buf_offt, p.filesz as usize - written as usize),
+                );
+                file.seek_to(p.offset as usize + written as usize);
+
+                if let Ok(n) = file.read(buf) {
+                    if n != buf.len() as usize {
+                        error = true;
+                        vm::free(vm, 1);
+                        break;
+                    }
+                    wofft += n as u64;
+                    vm::free(vm, 1);
+                } else {
+                    error = true;
+                    vm::free(vm, 1);
+                    break;
+                }
+            } else {
+                error = true;
+                break;
+            }
+        }
+
+        if error {
+            break;
+        }
+    }
+
+    let defer = defer(|| {
+        free_pt(new_user_pt);
+        task.user_pt = Some(old_user_pt);
+        restore_ttbr0(task.pid as usize, old_user_pt as usize);
+    });
+
+    if error {
+        return Err(());
+    }
+
+    let mut s = Vec::new();
+    let sp_el0 = as_slice_mut((GB - 4096) as *mut u8, 4096);
+    let mut w_idx = 4095;
+    for i in 0..envp.len() {
+        let slice = cstr_as_slice(envp[envp.len() - i - 1]);
+        if slice.len() == 0 {
+            break;
+        }
+        if slice.len() + 1 > w_idx {
+            return Err(());
+        }
+        sp_el0[w_idx] = 0;
+        w_idx -= slice.len() + 1;
+        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
+        s.push(&sp_el0[w_idx] as *const u8);
+    }
+
+    for i in 0..argv.len() {
+        let slice = cstr_as_slice(argv[argv.len() - i - 1]);
+        if slice.len() == 0 {
+            break;
+        }
+        if slice.len() + 1 > w_idx {
+            return Err(());
+        }
+        sp_el0[w_idx] = 0;
+        w_idx -= slice.len() + 1;
+        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
+        s.push(&sp_el0[w_idx] as *const u8);
+    }
+
+    if w_idx == 4095 {
+        if path.len() + 1 + 8 > w_idx {
+            return Err(());
+        }
+        sp_el0[w_idx] = 0;
+        w_idx -= path.len() + 1;
+        sp_el0[w_idx..w_idx + path.len()].copy_from_slice(path.as_bytes());
+        s.push(&sp_el0[w_idx] as *const u8);
+    }
+
+    w_idx = align_b(w_idx, 8);
+    let ptrs_len = 8 * (2/*nulls*/ + s.len()/*ptrs*/);
+    if w_idx < ptrs_len {
+        return Err(());
+    }
+
+    let ptrs = as_slice_mut(
+        &sp_el0[w_idx - ptrs_len] as *const u8 as *mut usize,
+        ptrs_len,
+    );
+
+    w_idx = 0;
+
+    for _ in 0..argv.len() {
+        ptrs[w_idx] = s.pop().unwrap() as usize;
+        w_idx += 1;
+    }
+
+    ptrs[w_idx] = 0;
+    w_idx += 1;
+
+    for _ in 0..envp.len() {
+        ptrs[w_idx] = s.pop().unwrap() as usize;
+        w_idx += 1;
+    }
+
+    ptrs[w_idx] = 0;
+
+    let tf = unsafe { (task.trapframe as *mut trap::Frame).as_mut() }.unwrap();
+
+    tf.pc = elf.header.entry;
+    tf.pstate = 0x0;
+    tf.sp_el0 = ptrs.as_ptr() as u64;
+
+    tf.regs[0] = argv.len() as u64 + 1;
+
+    free_pt(old_user_pt);
+    forget(defer);
+    Ok(())
 }
 
 pub fn sleep<T>(chan: u64, lock: &Lock<T>) {
@@ -298,12 +507,8 @@ pub extern "C" fn forkret() {
 
     restore_ttbr0(task.pid as usize, task.user_pt.unwrap() as usize);
 
-    let ptr = (GB - 4096) as *mut u8;
-    print!("PTR ===== {:x} {:x}\n", ptr as usize, r_ttbr0_el1());
-
-    let f = open("fox", p9::O::RDONLY as u32).unwrap();
-
     if FIRST.swap(false, Ordering::Release) {
+        execv("main", &["main\0".as_ptr()], &["FOO:bar\0".as_ptr()]).unwrap();
         print!("FIRST SHIT!\n");
     }
 

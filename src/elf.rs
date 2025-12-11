@@ -201,7 +201,7 @@ pub struct PhIter<'a> {
 }
 
 impl<'a> PhIter<'a> {
-    pub fn new(elf: &mut Elf) -> PhIter {
+    pub fn new(elf: &'a mut Elf) -> PhIter<'a> {
         PhIter { elf, idx: 0 }
     }
 

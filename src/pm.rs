@@ -235,7 +235,7 @@ impl Allocator {
         let mut i = align_f(k_end, 4 * KB);
         let ram_end = self.offt + GB;
         while i < ram_end {
-            self.free(i as *mut u8);
+            self.free(i);
             i += 4 * KB;
         }
     }
@@ -244,7 +244,7 @@ impl Allocator {
         let mut i = self.offt;
         let ram_end = align_b(k_begin, 4 * KB);
         while i < ram_end {
-            self.free(i as *mut u8);
+            self.free(i);
             i += 4 * KB;
         }
     }
@@ -326,7 +326,7 @@ impl Allocator {
         addr ^ (4096 << (Allocator::ORDER - ord))
     }
 
-    fn free(&mut self, addr: *mut u8) {
+    fn free(&mut self, addr: usize) {
         let addr = (addr as usize) - self.offt;
         assert!(addr < self.size);
         let idx = addr / 4096;
@@ -341,12 +341,16 @@ impl Allocator {
     }
 }
 
-pub fn alloc(n: usize) -> Option<usize> {
+pub fn alloc(n: usize) -> Result<usize, ()> {
     let lock = ALLOC.acquire();
-    lock.as_mut().alloc(n)
+    if let Some(p) = lock.as_mut().alloc(n) {
+        Ok(p)
+    } else {
+        Err(())
+    }
 }
 
-pub fn free(addr: *mut u8) {
+pub fn free(addr: usize) {
     let lock = ALLOC.acquire();
     lock.as_mut().free(addr);
 }

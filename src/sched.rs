@@ -20,11 +20,11 @@ use crate::{
     heap::SyncUnsafeCell,
     isb, p9,
     pm::{self, GB, align_b, align_f},
-    print, pt_from_u64,
+    print,
     spin::Lock,
     stuff::{BitSet128, as_slice_mut, cstr_as_slice, defer},
     trap,
-    vm::{self, Vaddr, free_pt, map_v2p_4k_inner, wrap, zero_phys_pt},
+    vm::{self, PmWrap, Vaddr, free_pt, map_v2p_4k_inner},
     wfe, wfi,
 };
 
@@ -95,10 +95,11 @@ pub struct Task {
     state: State,
     ctx: [u64; 14],
     lock: Lock<()>,
-    trapframe: u64,
+    pub trapframe: u64,
     user_pt: Option<u64>,
     chan: Option<u64>,
     pid: u16,
+    pub files: [Option<&'static mut fs::File>; 8],
 }
 
 unsafe impl Sync for Task {}
@@ -113,32 +114,23 @@ impl Task {
             user_pt: None,
             chan: None,
             pid: 0,
+            files: [None, None, None, None, None, None, None, None],
         }
     }
 
-    fn map(&mut self, v: usize, p: usize, perms: u64) -> Result<(), ()> {
-        match self.user_pt {
-            Some(l0_pt) => {
-                let l0_pt = pt_from_u64!(l0_pt);
-                if let Err(_) = map_v2p_4k_inner(l0_pt, v, p, perms) {
-                    return Err(());
-                }
-                vm::free_4k_direct(l0_pt.as_ptr() as usize);
-                Ok(())
-            }
-            _ => Err(()),
-        }
+    pub fn get_trap_frame(&self) -> Option<&mut trap::Frame> {
+        unsafe { (self.trapframe as *mut trap::Frame).as_mut() }
     }
-
-    fn alloc(&mut self, vfrom: usize, mut len: usize) {}
 
     fn init_1(&mut self, pc: u64) {
-        self.user_pt = Some(pm::alloc(4096).unwrap() as u64);
-        zero_phys_pt(self.user_pt.unwrap());
+        let user_pt = pm::alloc(4096).unwrap() as u64;
+        self.user_pt = Some(user_pt);
+        let l0_pt = PmWrap::new(self.user_pt.unwrap() as usize, vm::PR_PW, true).unwrap();
+        // zero_phys_pt(self.user_pt.unwrap());
 
         // writable by all
         let sp_el0 = pm::alloc(4096).unwrap();
-        self.map(GB - 4096, sp_el0, vm::PR_PW_UR_UW1).unwrap();
+        map(l0_pt.as_slice_mut(), GB - 4096, sp_el0, vm::PR_PW_UR_UW1).unwrap();
         let sp_el0 = GB;
 
         let sp_el1 = pm::alloc(4096).unwrap();
@@ -155,56 +147,42 @@ impl Task {
         self.ctx[13] = forkret as *const fn() as u64;
 
         self.trapframe = tf_ptr as u64;
+
+        self.files[0] = Some(fs::open_cons().unwrap());
+        self.files[1] = Some(fs::open_cons().unwrap());
     }
+}
+
+fn map(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Result<usize, vm::Error> {
+    map_v2p_4k_inner(l0_pt, v, p, perms)
 }
 
 pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), ()> {
     let task = mycpu().get_task().unwrap();
+    let user_pt = pm::alloc(4096).map_err(|_| ())?;
 
-    let old_user_pt = task.user_pt.unwrap();
+    let defer_user_pt = defer(|| {
+        vm::free_pt(user_pt as u64);
+    });
 
-    let new_user_pt = if let Some(p) = pm::alloc(4096) {
-        p
-    } else {
-        return Err(());
-    } as u64;
+    let l0_pt = PmWrap::new(user_pt as usize, vm::PR_PW, true).unwrap();
 
-    zero_phys_pt(new_user_pt);
+    let user_sp = pm::alloc(4096).map_err(|_| ())?;
+    let defer_user_sp = defer(|| {
+        pm::free(user_sp as usize);
+    });
 
-    task.user_pt = Some(new_user_pt);
-    restore_ttbr0(task.pid as usize, new_user_pt as usize);
+    map(l0_pt.as_slice_mut(), GB - 4096, user_sp, vm::PR_PW_UR_UW1) //
+        .map_err(|_| ())?;
 
-    if let Some(new_user_sp) = pm::alloc(4096) {
-        if let Err(_) = task.map(GB - 4096, new_user_sp, vm::PR_PW_UR_UW1) {
-            pm::free(new_user_sp as *mut u8);
-            task.user_pt = Some(old_user_pt);
-            restore_ttbr0(task.pid as usize, old_user_pt as usize);
-            return Err(());
-        }
-    } else {
-        task.user_pt = Some(old_user_pt);
-        restore_ttbr0(task.pid as usize, old_user_pt as usize);
-        return Err(());
-    }
+    forget(defer_user_sp);
 
-    let mut elf = if let Ok(elf) = Elf::new(path) {
-        elf
-    } else {
-        free_pt(new_user_pt);
-        task.user_pt = Some(old_user_pt);
-        restore_ttbr0(task.pid as usize, old_user_pt as usize);
-        return Err(());
-    };
+    let mut elf = Elf::new(path).map_err(|_| ())?;
 
     let file = unsafe { (elf.file as *mut File).as_mut() }.unwrap();
     let mut phit = PhIter::new(&mut elf);
     let mut ph = Elf64Phdr::zeroed();
-    let mut error = false;
     while let Some(p) = phit.next((&mut ph) as *mut Elf64Phdr) {
-        if error {
-            break;
-        }
-
         if p.kind as u64 != elf::PT_LOAD {
             continue;
         }
@@ -214,8 +192,12 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         let pages = len / 4096;
         let mut wofft = p.vaddr;
         for i in 0..pages {
-            let pm = pm::alloc(4096).unwrap();
-            if let Err(_) = task.map(
+            let pm = pm::alloc(4096).map_err(|_| ())?;
+            let defer_pm = defer(|| {
+                crate::pm::free(pm as usize);
+            });
+            map(
+                l0_pt.as_slice_mut(),
                 vfrom + i * 4096,
                 pm,
                 if p.flags == elf::PF_R | elf::PF_X {
@@ -225,61 +207,39 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
                 } else if p.flags == elf::PF_R {
                     vm::PR_UR
                 } else {
-                    error = true;
-                    break;
+                    panic!("unhandled flags combo")
                 },
-            ) {
-                pm::free(pm as *mut u8);
-                error = true;
-                break;
+            )
+            .map_err(|_| ())?;
+            forget(defer_pm);
+
+            let vm = PmWrap::new(pm, vm::PR_PW, false).map_err(|_| ())?;
+            let buf_offt = wofft as usize % 4096;
+            let written = wofft - p.vaddr;
+            let buf = &mut vm.as_slice_mut::<u8>()
+                [buf_offt..min(4096 - buf_offt, p.filesz as usize - written as usize)];
+
+            file.seek_to(p.offset as usize + written as usize);
+
+            let n = file.read(buf).map_err(|_| ())?;
+            if n != buf.len() as usize {
+                return Err(());
             }
 
-            if let Ok(vm) = vm::map(pm, 1, vm::PR_PW) {
-                let buf_offt = wofft as usize % 4096;
-                let written = wofft - p.vaddr;
-                let buf = as_slice_mut(
-                    (vm + buf_offt) as *mut u8, //
-                    min(4096 - buf_offt, p.filesz as usize - written as usize),
-                );
-                file.seek_to(p.offset as usize + written as usize);
-
-                if let Ok(n) = file.read(buf) {
-                    if n != buf.len() as usize {
-                        error = true;
-                        vm::free(vm, 1);
-                        break;
-                    }
-                    wofft += n as u64;
-                    vm::free(vm, 1);
-                } else {
-                    error = true;
-                    vm::free(vm, 1);
-                    break;
-                }
-            } else {
-                error = true;
-                break;
-            }
+            wofft += n as u64;
         }
-
-        if error {
-            break;
-        }
-    }
-
-    let defer = defer(|| {
-        free_pt(new_user_pt);
-        task.user_pt = Some(old_user_pt);
-        restore_ttbr0(task.pid as usize, old_user_pt as usize);
-    });
-
-    if error {
-        return Err(());
     }
 
     let mut s = Vec::new();
-    let sp_el0 = as_slice_mut((GB - 4096) as *mut u8, 4096);
-    let mut w_idx = 4095;
+
+    let sp_el0_w = PmWrap::new(user_sp, vm::PR_PW, true).map_err(|_| ())?;
+    //as_slice_mut((GB - 4096) as *mut u8, 4096);
+    let sp_el0 = sp_el0_w.as_slice_mut::<u8>();
+    let mut w_idx = 4096;
+    let btm = GB - 4096;
+
+    s.push(0); // envp null term
+
     for i in 0..envp.len() {
         let slice = cstr_as_slice(envp[envp.len() - i - 1]);
         if slice.len() == 0 {
@@ -288,11 +248,14 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         if slice.len() + 1 > w_idx {
             return Err(());
         }
+        w_idx -= 1;
         sp_el0[w_idx] = 0;
-        w_idx -= slice.len() + 1;
+        w_idx -= slice.len();
         sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
-        s.push(&sp_el0[w_idx] as *const u8);
+        s.push(btm + w_idx);
     }
+
+    s.push(0); // argv null term
 
     for i in 0..argv.len() {
         let slice = cstr_as_slice(argv[argv.len() - i - 1]);
@@ -302,24 +265,30 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         if slice.len() + 1 > w_idx {
             return Err(());
         }
+        w_idx -= 1;
         sp_el0[w_idx] = 0;
-        w_idx -= slice.len() + 1;
+        w_idx -= slice.len();
         sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
-        s.push(&sp_el0[w_idx] as *const u8);
+        s.push(btm + w_idx);
     }
 
     if w_idx == 4095 {
-        if path.len() + 1 + 8 > w_idx {
+        if path.len() + 1 > w_idx {
             return Err(());
         }
+        w_idx -= 1;
         sp_el0[w_idx] = 0;
-        w_idx -= path.len() + 1;
+        w_idx -= path.len();
         sp_el0[w_idx..w_idx + path.len()].copy_from_slice(path.as_bytes());
-        s.push(&sp_el0[w_idx] as *const u8);
+        s.push(btm + w_idx);
     }
 
     w_idx = align_b(w_idx, 8);
-    let ptrs_len = 8 * (2/*nulls*/ + s.len()/*ptrs*/);
+    if w_idx < 8 {
+        return Err(());
+    }
+
+    let ptrs_len = 8 * s.len();
     if w_idx < ptrs_len {
         return Err(());
     }
@@ -329,33 +298,39 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         ptrs_len,
     );
 
+    let sp_pos = GB - (ptrs_len + (4096 - w_idx));
     w_idx = 0;
 
-    for _ in 0..argv.len() {
-        ptrs[w_idx] = s.pop().unwrap() as usize;
+    while let Some(ptr) = s.pop() {
+        ptrs[w_idx] = ptr as usize;
         w_idx += 1;
     }
 
-    ptrs[w_idx] = 0;
-    w_idx += 1;
-
-    for _ in 0..envp.len() {
-        ptrs[w_idx] = s.pop().unwrap() as usize;
-        w_idx += 1;
-    }
-
-    ptrs[w_idx] = 0;
+    // print!("==================\n");
+    // let tmp = sp_el0_w.as_slice::<u64>();
+    // for i in 0..tmp.len() {
+    //     if tmp[i] == 0 {
+    //         print!(".");
+    //     } else {
+    //         print!("{}", tmp[i]);
+    //     }
+    // }
+    // print!("\n==================\n");
 
     let tf = unsafe { (task.trapframe as *mut trap::Frame).as_mut() }.unwrap();
 
     tf.pc = elf.header.entry;
     tf.pstate = 0x0;
-    tf.sp_el0 = ptrs.as_ptr() as u64;
+    tf.sp_el0 = sp_pos as u64;
 
     tf.regs[0] = argv.len() as u64 + 1;
+    tf.regs[1] = sp_pos as u64;
 
-    free_pt(old_user_pt);
-    forget(defer);
+    free_pt(task.user_pt.unwrap());
+
+    forget(defer_user_pt);
+    task.user_pt = Some(user_pt as u64);
+    restore_ttbr0(task.pid as usize, user_pt as usize);
     Ok(())
 }
 

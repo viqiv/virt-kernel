@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 
-use crate::{heap::SyncUnsafeCell, trap::gic_enable_intr, vm};
+use crate::{cons, heap::SyncUnsafeCell, trap::gic_enable_intr, vm};
 
 static MAP: SyncUnsafeCell<usize> = SyncUnsafeCell(UnsafeCell::new(0));
 
@@ -10,6 +10,10 @@ static MAP: SyncUnsafeCell<usize> = SyncUnsafeCell(UnsafeCell::new(0));
 fn write_char(c: u8, map: usize) {
     let dr = map as *mut u8;
     unsafe { dr.write_volatile(c) };
+}
+
+pub fn putc(c: u8) {
+    write_char(c, unsafe { MAP.0.get().read() });
 }
 
 fn write_bytes(b: &[u8], map: usize) {
@@ -27,6 +31,12 @@ impl core::fmt::Write for Writer {
     }
 }
 
+impl Writer {
+    pub fn write_bytes(buf: &[u8]) {
+        write_bytes(buf, unsafe { MAP.0.get().read() });
+    }
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{
@@ -36,7 +46,7 @@ macro_rules! print {
 }
 
 pub fn init_tx() {
-    let v = vm::map_4k(0x9000000, vm::PR_PW).unwrap();
+    let v = vm::map(0x9000000, 1, vm::PR_PW).unwrap();
     unsafe { MAP.0.get().write(v) };
     enable_tx(v);
 }
@@ -80,7 +90,8 @@ fn read() -> u8 {
 
 pub fn handle_rx() {
     let c = read();
-    print!("uart... {}\n", c as char);
+    // print!("uart... {}\n", c);
     // print!("{:?}\n", frame);
+    cons::push_char(c);
     clr_rx();
 }

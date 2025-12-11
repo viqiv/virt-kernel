@@ -1,8 +1,10 @@
 use crate::{
     _boot_stack, _boot_stack_btm, arch,
     heap::SyncUnsafeCell,
-    p9, print, timer, uart,
-    vm::{self, map_4k},
+    p9, print,
+    sched::mycpu,
+    svc, timer, uart,
+    vm::{self},
     wfi,
 };
 use core::{
@@ -38,6 +40,11 @@ pub extern "C" fn irq_handler(frame: &Frame) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sync_handler(frame: &Frame) {
+    mycpu().get_task().unwrap().trapframe = frame as *const Frame as u64;
+    let esr = arch::r_esr_el1();
+    if esr >> 26 == 0b010101 {
+        return svc::handle();
+    }
     let far = arch::r_far_el1();
     let elr = arch::r_elr_el1();
     print!(
@@ -59,23 +66,23 @@ pub extern "C" fn sync_handler(frame: &Frame) {
 #[allow(unused)]
 pub extern "C" fn _sync_handler() {
     naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "stp x27, x28, [sp, #-16]!",
+        "stp x25, x26, [sp, #-16]!",
+        "stp x23, x24, [sp, #-16]!",
+        "stp x21, x22, [sp, #-16]!",
+        "stp x19, x20, [sp, #-16]!",
+        "stp x17, x18, [sp, #-16]!",
+        "stp x15, x16, [sp, #-16]!",
+        "stp x13, x14, [sp, #-16]!",
+        "stp x11, x12, [sp, #-16]!",
+        "stp x9, x10, [sp, #-16]!",
+        "stp x7, x8, [sp, #-16]!",
+        "stp x5, x6, [sp, #-16]!",
+        "stp x3, x4, [sp, #-16]!",
+        "stp x1, x2, [sp, #-16]!",
+        "mrs x1, spsr_el1",
         "stp x1, x0, [sp, #-16]!",
-        "stp x3, x2, [sp, #-16]!",
-        "stp x5, x4, [sp, #-16]!",
-        "stp x7, x6, [sp, #-16]!",
-        "stp x9, x8, [sp, #-16]!",
-        "stp x11, x10, [sp, #-16]!",
-        "stp x13, x12, [sp, #-16]!",
-        "stp x15, x14, [sp, #-16]!",
-        "stp x17, x16, [sp, #-16]!",
-        "stp x19, x18, [sp, #-16]!",
-        "stp x21, x20, [sp, #-16]!",
-        "stp x23, x22, [sp, #-16]!",
-        "stp x25, x24, [sp, #-16]!",
-        "stp x27, x26, [sp, #-16]!",
-        "stp x29, x28, [sp, #-16]!",
-        "mrs x0, spsr_el1",
-        "stp x0, x30, [sp, #-16]!",
         "mrs x0, elr_el1",
         "mrs x1, sp_el0",
         "stp x0, x1, [sp, #-16]!",
@@ -84,23 +91,23 @@ pub extern "C" fn _sync_handler() {
         "ldp x0, x1, [sp], #16",
         "msr elr_el1, x0",
         "msr sp_el0, x1",
-        "ldp x0, x30, [sp], #16",
-        "msr spsr_el1, x0",
-        "ldp x29, x28, [sp], #16",
-        "ldp x27, x26, [sp], #16",
-        "ldp x25, x24, [sp], #16",
-        "ldp x23, x22, [sp], #16",
-        "ldp x21, x20, [sp], #16",
-        "ldp x19, x18, [sp], #16",
-        "ldp x17, x16, [sp], #16",
-        "ldp x15, x14, [sp], #16",
-        "ldp x13, x12, [sp], #16",
-        "ldp x11, x10, [sp], #16",
-        "ldp x9, x8, [sp], #16",
-        "ldp x7, x6, [sp], #16",
-        "ldp x5, x4, [sp], #16",
-        "ldp x3, x2, [sp], #16",
         "ldp x1, x0, [sp], #16",
+        "msr spsr_el1, x1",
+        "ldp x1, x2, [sp], #16",
+        "ldp x3, x4, [sp], #16",
+        "ldp x5, x6, [sp], #16",
+        "ldp x7, x8, [sp], #16",
+        "ldp x9, x10, [sp], #16",
+        "ldp x11, x12, [sp], #16",
+        "ldp x13, x14, [sp], #16",
+        "ldp x15, x16, [sp], #16",
+        "ldp x17, x18, [sp], #16",
+        "ldp x19, x20, [sp], #16",
+        "ldp x21, x22, [sp], #16",
+        "ldp x23, x24, [sp], #16",
+        "ldp x25, x26, [sp], #16",
+        "ldp x27, x28, [sp], #16",
+        "ldp x29, x30, [sp], #16",
         "eret"
     );
 }
@@ -110,23 +117,23 @@ pub extern "C" fn _sync_handler() {
 #[allow(unused)]
 pub extern "C" fn _irq_handler() {
     naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "stp x27, x28, [sp, #-16]!",
+        "stp x25, x26, [sp, #-16]!",
+        "stp x23, x24, [sp, #-16]!",
+        "stp x21, x22, [sp, #-16]!",
+        "stp x19, x20, [sp, #-16]!",
+        "stp x17, x18, [sp, #-16]!",
+        "stp x15, x16, [sp, #-16]!",
+        "stp x13, x14, [sp, #-16]!",
+        "stp x11, x12, [sp, #-16]!",
+        "stp x9, x10, [sp, #-16]!",
+        "stp x7, x8, [sp, #-16]!",
+        "stp x5, x6, [sp, #-16]!",
+        "stp x3, x4, [sp, #-16]!",
+        "stp x1, x2, [sp, #-16]!",
+        "mrs x1, spsr_el1",
         "stp x1, x0, [sp, #-16]!",
-        "stp x3, x2, [sp, #-16]!",
-        "stp x5, x4, [sp, #-16]!",
-        "stp x7, x6, [sp, #-16]!",
-        "stp x9, x8, [sp, #-16]!",
-        "stp x11, x10, [sp, #-16]!",
-        "stp x13, x12, [sp, #-16]!",
-        "stp x15, x14, [sp, #-16]!",
-        "stp x17, x16, [sp, #-16]!",
-        "stp x19, x18, [sp, #-16]!",
-        "stp x21, x20, [sp, #-16]!",
-        "stp x23, x22, [sp, #-16]!",
-        "stp x25, x24, [sp, #-16]!",
-        "stp x27, x26, [sp, #-16]!",
-        "stp x29, x28, [sp, #-16]!",
-        "mrs x0, spsr_el1",
-        "stp x0, x30, [sp, #-16]!",
         "mrs x0, elr_el1",
         "mrs x1, sp_el0",
         "stp x0, x1, [sp, #-16]!",
@@ -135,23 +142,23 @@ pub extern "C" fn _irq_handler() {
         "ldp x0, x1, [sp], #16",
         "msr elr_el1, x0",
         "msr sp_el0, x1",
-        "ldp x0, x30, [sp], #16",
-        "msr spsr_el1, x0",
-        "ldp x29, x28, [sp], #16",
-        "ldp x27, x26, [sp], #16",
-        "ldp x25, x24, [sp], #16",
-        "ldp x23, x22, [sp], #16",
-        "ldp x21, x20, [sp], #16",
-        "ldp x19, x18, [sp], #16",
-        "ldp x17, x16, [sp], #16",
-        "ldp x15, x14, [sp], #16",
-        "ldp x13, x12, [sp], #16",
-        "ldp x11, x10, [sp], #16",
-        "ldp x9, x8, [sp], #16",
-        "ldp x7, x6, [sp], #16",
-        "ldp x5, x4, [sp], #16",
-        "ldp x3, x2, [sp], #16",
         "ldp x1, x0, [sp], #16",
+        "msr spsr_el1, x1",
+        "ldp x1, x2, [sp], #16",
+        "ldp x3, x4, [sp], #16",
+        "ldp x5, x6, [sp], #16",
+        "ldp x7, x8, [sp], #16",
+        "ldp x9, x10, [sp], #16",
+        "ldp x11, x12, [sp], #16",
+        "ldp x13, x14, [sp], #16",
+        "ldp x15, x16, [sp], #16",
+        "ldp x17, x18, [sp], #16",
+        "ldp x19, x20, [sp], #16",
+        "ldp x21, x22, [sp], #16",
+        "ldp x23, x24, [sp], #16",
+        "ldp x25, x26, [sp], #16",
+        "ldp x27, x28, [sp], #16",
+        "ldp x29, x30, [sp], #16",
         "eret"
     );
 }
@@ -266,9 +273,9 @@ pub fn gic_disable_intr(idx: usize) {
 }
 
 pub fn init() {
-    let map = map_4k(0x8000000, vm::PR_PW).unwrap();
+    let map = vm::map(0x8000000, 1, vm::PR_PW).unwrap();
     unsafe { GIC_DIST.0.get().write(map) };
-    let map = map_4k(0x8010000, vm::PR_PW).unwrap();
+    let map = vm::map(0x8010000, 1, vm::PR_PW).unwrap();
     unsafe { GIC_CPU.0.get().write(map) };
     gic_enable();
 }

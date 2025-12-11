@@ -1,16 +1,14 @@
-use alloc::vec::Vec;
-
 use crate::{
-    _bss_end, _data_end, _kernel_end, _rodata_end, _text_end, _user_end,
+    _bss_end, _data_end, _rodata_end, _text_end, _user_end,
     arch::{self, tlbi_vaee1},
     dsb, isb,
     pm::{GB, KB, MB},
     print,
-    stuff::BitSet128,
+    stuff::{BitSet128, as_slice, as_slice_mut, defer},
     tlbi_vmalle1,
 };
-use core::{arch::asm, cell::UnsafeCell, ptr::slice_from_raw_parts_mut};
-use core::{cell::OnceCell, fmt::Display, hash::Hash, ptr::NonNull};
+use core::{arch::asm, cell::UnsafeCell, mem};
+use core::{fmt::Display, ptr::NonNull};
 
 use crate::{
     pm::{self, align_b, align_f},
@@ -88,21 +86,11 @@ const VOFFT: u64 = 0xffff_0000_0000_0000;
 
 static PT: Lock<Table> = Lock::new("vm", Table::new());
 
-static DPT_L1: Table2 = Table2::new();
-static DPT_L2: Table2 = Table2::new();
-static DPT_L3: Table2 = Table2::new();
-
-#[unsafe(no_mangle)]
-pub fn wrap(p: usize) -> usize {
-    let v = alloc_4k_direct().unwrap();
-    let vaddr = Vaddr::new(v);
-    unsafe { DPT_L3.inner.get().as_mut() }.unwrap().data[vaddr.l3() as usize] =
-        p as u64 | PR_PW | 0x403;
-    tlbi_vaee1(v as u64);
-    dsb!();
-    isb!();
-    v
-}
+// 512 pages with fixed vm location
+static FIXED_L1: Table2 = Table2::new();
+static FIXED_L2: Table2 = Table2::new();
+static FIXED_L3: Table2 = Table2::new();
+static FIXED_PAGES: Lock<Region> = Lock::new("vm_regions", Region::new(0));
 
 fn zero_pt(ptr: *mut u64) {
     for i in 0..512 {
@@ -110,12 +98,10 @@ fn zero_pt(ptr: *mut u64) {
     }
 }
 
-pub fn zero_phys_pt(pt: u64) {
-    let ptr = wrap(pt as usize) as *mut u64;
+fn zero_pt_slice(ptr: &mut [u64]) {
     for i in 0..512 {
-        unsafe { ptr.add(i).write(0) }
+        ptr[i] = 0;
     }
-    free_4k_direct(ptr as usize);
 }
 
 fn pt_alloc_if_0(idx: usize, pt: &mut [u64]) -> &mut [u64] {
@@ -123,67 +109,90 @@ fn pt_alloc_if_0(idx: usize, pt: &mut [u64]) -> &mut [u64] {
     let mut nxt_pt = pt[idx];
     if nxt_pt == 0 {
         nxt_pt = match pm::alloc(4096) {
-            Some(ptr) => {
+            Ok(ptr) => {
                 zero_pt((ptr as u64 + VOFFT) as *mut u64);
                 ptr as u64 | 3
             }
-            None => unreachable!(), /*TODO handle error*/
+            _ => unreachable!(), /*TODO handle error*/
         };
         pt[idx] = nxt_pt;
     }
 
-    let nxt_pt = unsafe {
-        slice_from_raw_parts_mut(
-            ((nxt_pt as *mut u64 as usize & PHY_MASK) + VOFFT as usize) as *mut u64,
-            512,
-        )
-        .as_mut()
-    }
-    .unwrap();
-
+    let nxt_pt = as_slice_mut(
+        ((nxt_pt as *mut u64 as usize & PHY_MASK) + VOFFT as usize) as *mut u64,
+        512,
+    );
     nxt_pt
 }
 
-#[macro_export]
-macro_rules! pt_from_u64 {
-    ($ptr:expr) => {
-        unsafe {
-            slice_from_raw_parts_mut(
-                wrap($ptr as *mut u64 as usize & $crate::vm::PHY_MASK) as *mut u64,
-                512,
-            )
-            .as_mut()
-        }
-        .unwrap()
-    };
+pub struct PmWrap {
+    map: usize,
 }
 
-/// direct pointer must be freed
-pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> &mut [u64] {
+impl PmWrap {
+    pub fn new(pm: usize, perms: u64, zero: bool) -> Result<PmWrap, ()> {
+        let pm = pm & PHY_MASK;
+        if pm < 0x4000_0000 {
+            return Err(());
+        }
+        let lock = FIXED_PAGES.acquire();
+        if let Some(v) = lock.as_mut().alloc(1) {
+            let vaddr = Vaddr::new(v);
+            unsafe { FIXED_L3.inner.get().as_mut() } //
+                .unwrap()
+                .data[vaddr.l3() as usize] = pm as u64 | perms | 0x403;
+            tlbi_vaee1(v as u64);
+            dsb!();
+            isb!();
+            if zero {
+                zero_pt(v as *mut u64);
+            }
+            Ok(PmWrap { map: v })
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn as_slice<T>(&self) -> &[T] {
+        as_slice(self.map as *const T, 4096 / size_of::<T>())
+    }
+
+    pub fn as_slice_mut<T>(&self) -> &mut [T] {
+        as_slice_mut(self.map as *mut T, 4096 / size_of::<T>())
+    }
+
+    // pub fn as_ref<T>(&self) -> &T {
+    //     unsafe { (self.map as *const T).as_ref() }.unwrap()
+    // }
+
+    // pub fn as_mut<T>(&self) -> &T {
+    //     unsafe { (self.map as *mut T).as_mut() }.unwrap()
+    // }
+}
+
+impl Drop for PmWrap {
+    fn drop(&mut self) {
+        let lock = FIXED_PAGES.acquire();
+        lock.as_mut().free_1(self.map);
+    }
+}
+
+pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> Result<PmWrap, ()> {
     assert!(pt.len() == 512);
     let mut nxt_pt = pt[idx];
     let mut new = false;
     if nxt_pt == 0 {
         match pm::alloc(4096) {
-            Some(ptr) => {
+            Ok(ptr) => {
                 pt[idx] = ptr as u64 | 3;
                 nxt_pt = ptr as u64;
                 new = true;
             }
-            None => unreachable!(), /*TODO handle error*/
+            _ => unreachable!(), /*TODO handle error*/
         };
     }
 
-    let nxt_pt = pt_from_u64!(nxt_pt);
-    if new {
-        zero_pt(nxt_pt.as_mut_ptr());
-    }
-    // let nxt_pt = unsafe {
-    //     slice_from_raw_parts_mut(wrap(nxt_pt as *mut u64 as usize & !0xfff) as *mut u64, 512)
-    //         .as_mut()
-    // }
-    // .unwrap();
-
+    let nxt_pt = PmWrap::new(nxt_pt as usize, PR_PW, new);
     nxt_pt
 }
 
@@ -267,23 +276,17 @@ pub enum Error {
 
 pub fn map_v2p_4k_inner(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let vaddr = Vaddr::new(v);
-    let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt);
-    let l1_pt_w = l1_pt.as_ptr();
-    let l2_pt = pt_alloc_if_0_2(vaddr.l1() as usize, l1_pt);
-    let l2_pt_w = l2_pt.as_ptr();
-    let l3_pt = pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt);
+    let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt).map_err(|_| Error::Alloc)?;
+    let l2_pt =
+        pt_alloc_if_0_2(vaddr.l1() as usize, l1_pt.as_slice_mut()).map_err(|_| Error::Alloc)?;
+    let l3_pt =
+        pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt.as_slice_mut()).map_err(|_| Error::Alloc)?;
 
-    if l3_pt[vaddr.l3() as usize] != 0 {
+    if l3_pt.as_slice::<u64>()[vaddr.l3() as usize] != 0 {
         return Err(Error::Exists);
     }
 
-    l3_pt[vaddr.l3() as usize] = (p as u64 | perms | 0x403) as u64;
-
-    free_4k_direct(l1_pt_w as usize);
-    free_4k_direct(l2_pt_w as usize);
-    free_4k_direct(l3_pt.as_ptr() as usize);
-
-    // print!("va {:x} pa = {:x}\n", v, p);
+    l3_pt.as_slice_mut()[vaddr.l3() as usize] = (p as u64 | perms | 0x403) as u64;
     tlbi_vaee1(v as u64);
     Ok(v)
 }
@@ -322,40 +325,41 @@ fn map_v2p_4k2(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     map_v2p_4k_inner(l0_pt, v, p, perms)
 }
 
-pub fn v2p(v: usize) -> Option<usize> {
-    let pt_lock = PT.acquire();
-    let l0_pt = &mut pt_lock.as_mut().data;
-
+fn walk_to_l3(l0_pt: &[u64], v: usize) -> Result<PmWrap, ()> {
     let vaddr = Vaddr::new(v);
 
     let l1_pt = l0_pt[vaddr.l0() as usize];
 
     if l1_pt == 0 {
-        return None;
+        return Err(());
     }
 
-    let l1_pt = wrap(l1_pt as usize & PHY_MASK) as *const u64;
-    let l2_pt = unsafe { *l1_pt.add(vaddr.l1() as usize) };
+    let l1_pt = PmWrap::new(l1_pt as usize, PR, false).map_err(|_| ())?;
+    let l2_pt = l1_pt.as_slice::<u64>()[vaddr.l1() as usize];
 
     if l2_pt == 0 {
-        return None;
+        return Err(());
     }
 
-    let l2_pt = wrap(l2_pt as usize & PHY_MASK) as *const u64;
-    let l3_pt = unsafe { *l2_pt.add(vaddr.l2() as usize) };
+    let l2_pt = PmWrap::new(l2_pt as usize, PR, false).map_err(|_| ())?;
+    let l3_pt = l2_pt.as_slice::<u64>()[vaddr.l2() as usize];
 
     if l3_pt == 0 {
-        return None;
+        return Err(());
     }
 
-    let l3_pt = wrap(l3_pt as usize & PHY_MASK) as *const u64;
-    let paddr = unsafe { *l3_pt.add(vaddr.l3() as usize) };
+    let l3_pt = PmWrap::new(l3_pt as usize, PR_PW, false).map_err(|_| ())?;
+    Ok(l3_pt)
+}
 
-    free_4k_direct(l1_pt as usize);
-    free_4k_direct(l2_pt as usize);
-    free_4k_direct(l3_pt as usize);
+pub fn v2p(v: usize) -> Result<usize, ()> {
+    let pt_lock = PT.acquire();
+    let l0_pt = &mut pt_lock.as_mut().data;
+    let vaddr = Vaddr::new(v);
 
-    Some((paddr as usize & PHY_MASK) | (v & 0xfff))
+    let l3_pt = walk_to_l3(l0_pt, v).map_err(|_| ())?;
+    let paddr = l3_pt.as_slice::<u64>()[vaddr.l3() as usize];
+    Ok((paddr as usize & PHY_MASK) | (v & 0xfff))
 }
 
 pub fn unmap_4k(v: usize) -> Result<(), ()> {
@@ -363,49 +367,23 @@ pub fn unmap_4k(v: usize) -> Result<(), ()> {
     let l0_pt = &mut pt_lock.as_mut().data;
 
     let vaddr = Vaddr::new(v);
-
-    let l1_pt = l0_pt[vaddr.l0() as usize];
-
-    if l1_pt == 0 {
-        return Err(());
-    }
-
-    let l1_pt = wrap(l1_pt as usize & PHY_MASK) as *const u64;
-    let l2_pt = unsafe { *l1_pt.add(vaddr.l1() as usize) };
-
-    if l2_pt == 0 {
-        return Err(());
-    }
-
-    let l2_pt = wrap(l2_pt as usize & PHY_MASK) as *const u64;
-    let l3_pt = unsafe { *l2_pt.add(vaddr.l2() as usize) };
-
-    if l3_pt == 0 {
-        return Err(());
-    }
-
-    let l3_pt = wrap(l3_pt as usize & PHY_MASK) as *mut u64;
-    unsafe { *l3_pt.add(vaddr.l3() as usize) = 0 };
-
-    free_4k_direct(l1_pt as usize);
-    free_4k_direct(l2_pt as usize);
-    free_4k_direct(l3_pt as usize);
+    let l3_pt = walk_to_l3(l0_pt, v).map_err(|_| ())?;
+    l3_pt.as_slice_mut::<u64>()[vaddr.l3() as usize] = 0;
 
     tlbi_vaee1(v as u64);
     Ok(())
 }
 
-fn free_walk(pt: &[u64], level: u8) {
+fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
     assert!(pt.len() == 512);
     if level < 3 {
         for i in 0..pt.len() {
             let paddr = pt[i] & PHY_MASK as u64;
             //HARDcoDE
             if paddr >= 0x40000000 {
-                let pt = pt_from_u64!(paddr);
-                free_walk(pt, level + 1);
-                free_4k_direct(pt.as_ptr() as usize);
-                pm::free(paddr as *mut u8);
+                let pt = PmWrap::new(paddr as usize, PR, false).map_err(|_| ())?;
+                free_walk(pt.as_slice_mut(), level + 1)?;
+                pm::free(paddr as usize);
             }
         }
     } else {
@@ -414,16 +392,17 @@ fn free_walk(pt: &[u64], level: u8) {
 
             //HARDcoDE
             if paddr >= 0x40000000 && (pt[i] & 3) > 0 {
-                pm::free(paddr as *mut u8);
+                pm::free(paddr as usize);
             }
         }
     }
+    Ok(())
 }
 
-pub fn free_pt(pt: u64) {
-    let pt = pt_from_u64!(pt);
-    free_walk(pt, 0);
-    free_4k_direct(pt.as_ptr() as usize);
+pub fn free_pt(pm_pt: u64) {
+    let pt = PmWrap::new(pm_pt as usize, PR, false).unwrap();
+    free_walk(pt.as_slice(), 0).unwrap();
+    pm::free(pm_pt as usize);
 }
 
 pub fn init(k_begin: usize, k_end: usize) {
@@ -433,13 +412,13 @@ pub fn init(k_begin: usize, k_end: usize) {
     use_4k_blocks(l0_pt, k_begin, k_end);
     let v = Vaddr::new(!0usize);
 
-    l0_pt[v.l0() as usize] = ((DPT_L1.inner.get() as u64) - VOFFT) | 3;
+    l0_pt[v.l0() as usize] = ((FIXED_L1.inner.get() as u64) - VOFFT) | 3;
 
     unsafe {
-        *DPT_L1.inner.get().cast::<u64>().add(v.l1() as usize) =
-            ((DPT_L2.inner.get()) as u64 - VOFFT) | 3;
-        *DPT_L2.inner.get().cast::<u64>().add(v.l2() as usize) =
-            ((DPT_L3.inner.get()) as u64 - VOFFT) | 3
+        *FIXED_L1.inner.get().cast::<u64>().add(v.l1() as usize) =
+            ((FIXED_L2.inner.get()) as u64 - VOFFT) | 3;
+        *FIXED_L2.inner.get().cast::<u64>().add(v.l2() as usize) =
+            ((FIXED_L3.inner.get()) as u64 - VOFFT) | 3
     };
     // WRAP.set(());
 
@@ -599,22 +578,21 @@ impl Region {
 }
 
 static REGIONS: Lock<Region> = Lock::new("vm_regions", Region::new(0));
-static DIRECTS: Lock<Region> = Lock::new("vm_regions", Region::new(0));
 
 fn init_regions(start_p: usize) {
     let lock = REGIONS.acquire();
     let first = lock.as_mut();
     first.start = align_f(start_p, 4 * KB) + VOFFT as usize;
 
-    let lock = DIRECTS.acquire();
+    let lock = FIXED_PAGES.acquire();
     let first = lock.as_mut();
     first.start = 0xffff_ffff_fff0_0000;
 }
 
-pub fn alloc_4k() -> Option<usize> {
-    let lock = REGIONS.acquire();
-    lock.as_mut().alloc(1)
-}
+// pub fn alloc_4k() -> Option<usize> {
+//     let lock = REGIONS.acquire();
+//     lock.as_mut().alloc(1)
+// }
 
 pub fn alloc(n: usize) -> Option<usize> {
     let lock = REGIONS.acquire();
@@ -633,29 +611,33 @@ pub fn free_4k(v: usize) {
     unmap_4k(v).unwrap();
 }
 
-pub fn alloc_4k_direct() -> Option<usize> {
-    let lock = DIRECTS.acquire();
-    lock.as_mut().alloc(1)
-}
+// pub fn alloc_4k_direct() -> Option<usize> {
+//     let lock = DIRECTS.acquire();
+//     lock.as_mut().alloc(1)
+// }
 
-pub fn free_4k_direct(v: usize) {
-    let lock = DIRECTS.acquire();
-    lock.as_mut().free_1(v)
-}
+// pub fn free_4k_direct(v: usize) {
+//     let lock = DIRECTS.acquire();
+//     lock.as_mut().free_1(v)
+// }
 
-pub fn map_4k(p: usize, perms: u64) -> Result<usize, Error> {
-    match alloc_4k() {
-        Some(v) => map_v2p_4k(v, p, perms),
-        _ => Err(Error::Alloc),
-    }
-}
+// fn map_4k(p: usize, perms: u64) -> Result<usize, Error> {
+//     match alloc_4k() {
+//         Some(v) => {
+//             map_v2p_4k(v, p, perms)
+//         },
+//         _ => Err(Error::Alloc),
+//     }
+// }
 
 pub fn map(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
     match alloc(n) {
         Some(v) => {
+            let defer = defer(|| free(v, n));
             for i in 0..n {
-                map_v2p_4k(v + (i * 4 * KB), p + (i * 4 * KB), perms).unwrap();
+                map_v2p_4k(v + (i * 4 * KB), p + (i * 4 * KB), perms).map_err(|e| e)?;
             }
+            mem::forget(defer);
             Ok(v)
         }
         _ => Err(Error::Alloc),
@@ -665,9 +647,11 @@ pub fn map(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
 pub fn map2(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
     match alloc(n) {
         Some(v) => {
+            let defer = defer(|| free(v, n));
             for i in 0..n {
-                map_v2p_4k2(v + (i * 4 * KB), p + (i * 4 * KB), perms).unwrap();
+                map_v2p_4k2(v + (i * 4 * KB), p + (i * 4 * KB), perms).map_err(|e| e)?;
             }
+            mem::forget(defer);
             Ok(v)
         }
         _ => Err(Error::Alloc),

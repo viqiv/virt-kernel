@@ -1,11 +1,19 @@
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use crate::{heap::SyncUnsafeCell, p9, spin::Lock};
+use crate::{
+    cons::{self},
+    heap::SyncUnsafeCell,
+    p9, print,
+    sched::mycpu,
+    spin::Lock,
+    stuff::{as_slice, as_slice_mut},
+};
 
 pub enum FileKind {
     None,
     Used,
-    P9(&'static p9::File),
+    P9(&'static mut p9::File),
+    Cons(&'static mut cons::File),
 }
 
 pub struct File {
@@ -27,7 +35,7 @@ impl File {
         if self.rc.load(Ordering::Acquire) == 0 {
             return Err(());
         }
-        match self.kind {
+        match &mut self.kind {
             FileKind::P9(p9f) => {
                 if let Ok(n) = p9f.read(buf, self.offt) {
                     self.offt = self.offt.wrapping_add(n);
@@ -36,6 +44,7 @@ impl File {
                     Err(())
                 }
             }
+            FileKind::Cons(c) => c.read(buf),
             _ => {
                 panic!("read: unhandled file kind.")
             }
@@ -46,7 +55,7 @@ impl File {
         if self.rc.load(Ordering::Acquire) == 0 {
             return Err(());
         }
-        match self.kind {
+        match &mut self.kind {
             FileKind::P9(p9f) => {
                 if let Ok(n) = p9f.write(buf, self.offt) {
                     self.offt = self.offt.wrapping_add(n);
@@ -55,6 +64,7 @@ impl File {
                     Err(())
                 }
             }
+            FileKind::Cons(c) => c.write(buf),
             _ => {
                 panic!("write: unhandled file kind.")
             }
@@ -72,7 +82,7 @@ impl File {
             Ordering::AcqRel, //
             Ordering::Relaxed,
         ) {
-            match self.kind {
+            match &self.kind {
                 FileKind::P9(p9f) => {
                     return if let Ok(_) = p9f.close() {
                         self.kind = FileKind::None;
@@ -123,6 +133,74 @@ pub fn open(path: &str, mode: u32) -> Result<&'static mut File, ()> {
     }
 
     Err(())
+}
+
+pub fn open_cons() -> Result<&'static mut File, ()> {
+    if let Some((_, file)) = alloc_file() {
+        file.kind = FileKind::Cons(cons::open());
+        file.rc = AtomicU16::new(1);
+        Ok(file)
+    } else {
+        Err(())
+    }
+}
+
+pub fn sys_write() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let fd = tf.regs[0] as usize;
+    if fd >= task.files.len() {
+        return !0;
+    }
+
+    if task.files[fd].is_none() {
+        return !0;
+    }
+
+    let len = tf.regs[2] as usize;
+    let ptr = tf.regs[1];
+
+    let file = task.files[fd].as_mut().unwrap();
+
+    if ptr == 0 {
+        return !0;
+    }
+    // i trust you user
+    let buf = as_slice(ptr as *const u8, len);
+    if let Ok(n) = file.write(buf) {
+        n as u64
+    } else {
+        !0
+    }
+}
+
+pub fn sys_read() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let fd = tf.regs[0] as usize;
+    if fd >= task.files.len() {
+        return !0;
+    }
+
+    if task.files[fd].is_none() {
+        return !0;
+    }
+
+    let len = tf.regs[2] as usize;
+    let ptr = tf.regs[1];
+
+    let file = task.files[fd].as_mut().unwrap();
+
+    if ptr == 0 {
+        return !0;
+    }
+    // i trust you user
+    let buf = as_slice_mut(ptr as *mut u8, len);
+    if let Ok(n) = file.read(buf) {
+        n as u64
+    } else {
+        !0
+    }
 }
 
 static FS: Lock<Fs> = Lock::new(

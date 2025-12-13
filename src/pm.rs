@@ -17,15 +17,25 @@ pub fn align_f(n: usize, t: usize) -> usize {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Page {
-    idx: usize,
-    ref_cnt: usize,
-    ord: usize,
-    next: Option<NonNull<Page>>,
-    magic: u64,
+#[repr(u32)]
+pub enum Flags {
+    None,
+    Used,
+    Cow,
+    Mid,
 }
 
-const MAGIC: u64 = 0xDEADBEEFCAFEBABE;
+#[derive(Debug, Clone, Copy)]
+pub struct Page {
+    pub idx: usize,
+    ord: usize,
+    pub ref_cnt: usize,
+    next: Option<NonNull<Page>>,
+    magic: u32,
+    pub flags: Flags,
+}
+
+const MAGIC: u32 = 0xDEADBEEF;
 
 impl Page {
     pub const fn new(idx: usize, ord: usize, rc: usize) -> Page {
@@ -35,6 +45,7 @@ impl Page {
             ord,
             next: None,
             magic: MAGIC,
+            flags: Flags::None,
         }
     }
 
@@ -93,6 +104,53 @@ impl Page {
             page = merg;
         }
     }
+
+    pub fn dup_for_cow(&mut self) {
+        self.assert_ok();
+        assert!(self.ref_cnt > 0);
+        self.ref_cnt += 1;
+        self.flags = Flags::Cow;
+    }
+
+    pub fn len(&self) -> usize {
+        4096 << (8 - self.ord)
+    }
+
+    pub fn mark_mids(&mut self) {
+        let ptr = self as *mut Page;
+        let n = self.len() / 4096;
+        for i in 1..n {
+            unsafe {
+                let mid = ptr.add(i).as_mut().unwrap();
+                mid.ref_cnt = i;
+                mid.flags = Flags::Mid;
+            }
+        }
+    }
+
+    pub fn unmark_mids(&mut self) {
+        let ptr = self as *mut Page;
+        let n = self.len() / 4096;
+        for i in 1..n {
+            unsafe {
+                let mid = ptr.add(i).as_mut().unwrap();
+                mid.ref_cnt = 0;
+                mid.flags = Flags::None;
+            }
+        }
+    }
+
+    pub fn get_head(&mut self) -> Option<&'static mut Page> {
+        if let Flags::Mid = self.flags {
+            unsafe { (self as *mut Page).sub(self.ref_cnt).as_mut() }
+        } else {
+            None
+        }
+    }
+
+    pub fn eql(&self, other: &Page) -> bool {
+        self as *const Page == other as *const Page
+    }
 }
 
 impl Default for Page {
@@ -103,6 +161,7 @@ impl Default for Page {
             ord: 0,
             next: None,
             magic: MAGIC,
+            flags: Flags::None,
         }
     }
 }
@@ -281,7 +340,7 @@ impl Allocator {
         if let Some(p) = self.free_lists[ord].rm_first() {
             let p = unsafe { p.as_mut() }.unwrap();
             p.assert_ok();
-            p.ref_cnt += 1;
+            p.ref_cnt = 1;
             p.rm_links();
             return Some((p.idx * 4096) as *mut u8);
         }
@@ -307,7 +366,7 @@ impl Allocator {
         if let Some(p) = self.free_lists[ord].rm_first() {
             let p = unsafe { p.as_mut() }.unwrap();
             p.assert_ok();
-            p.ref_cnt += 1;
+            p.ref_cnt = 1;
             p.rm_links();
             return Some((p.idx * 4096) as *mut u8);
         } else {
@@ -317,26 +376,50 @@ impl Allocator {
 
     fn alloc(&mut self, n: usize) -> Option<usize> {
         match self._alloc(n) {
-            Some(n) => Some((n as usize + self.offt)),
+            Some(n) => {
+                let page = self.lookup(n as usize + self.offt).unwrap();
+                page.mark_mids();
+                assert!(page.ref_cnt == 1);
+                page.flags = Flags::Used;
+                Some(n as usize + self.offt)
+            }
             None => None,
         }
+    }
+
+    pub fn idx2addr(&mut self, idx: usize) -> usize {
+        idx * 4096 + self.offt
     }
 
     fn get_buddy(addr: usize, ord: usize) -> usize {
         addr ^ (4096 << (Allocator::ORDER - ord))
     }
 
-    fn free(&mut self, addr: usize) {
+    fn lookup(&self, addr: usize) -> Option<&'static mut Page> {
+        if addr < self.offt {
+            return None;
+        }
         let addr = (addr as usize) - self.offt;
-        assert!(addr < self.size);
+        if addr >= self.size {
+            return None;
+        }
         let idx = addr / 4096;
-        let page = unsafe { self.page_ptr.add(idx).as_mut() }.unwrap();
+        unsafe { self.page_ptr.add(idx).as_mut() }
+    }
+
+    fn free(&mut self, addr: usize) {
+        let page = self.lookup(addr).unwrap();
         page.assert_ok();
+        if let Flags::Mid = page.flags {
+            return;
+        }
         assert!(page.ref_cnt > 0);
         page.ref_cnt -= 1;
         if page.ref_cnt > 0 {
             return;
         }
+        page.unmark_mids();
+        page.flags = Flags::None;
         page.join(self);
     }
 }
@@ -355,6 +438,11 @@ pub fn free(addr: usize) {
     lock.as_mut().free(addr);
 }
 
+pub fn lookup(addr: usize) -> Option<&'static mut Page> {
+    let lock = ALLOC.acquire();
+    lock.as_mut().lookup(addr)
+}
+
 pub fn init(k_begin: usize, k_end: usize) {
     let lock = ALLOC.acquire();
     lock.as_mut().init(k_begin, k_end);
@@ -363,6 +451,11 @@ pub fn init(k_begin: usize, k_end: usize) {
 pub fn free_low(k_begin: usize) {
     let lock = ALLOC.acquire();
     lock.as_mut().init_free_list2(k_begin);
+}
+
+pub fn idx2addr(idx: usize) -> usize {
+    let lock = ALLOC.acquire();
+    lock.as_mut().idx2addr(idx)
 }
 
 pub fn print_fl() {

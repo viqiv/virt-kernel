@@ -2,7 +2,7 @@ use crate::{
     _boot_stack, _boot_stack_btm, arch,
     heap::SyncUnsafeCell,
     p9, print,
-    sched::mycpu,
+    sched::{self, mycpu},
     svc, timer, uart,
     vm::{self},
     wfi,
@@ -12,7 +12,7 @@ use core::{
     cell::UnsafeCell,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Frame {
     pub pc: u64,
@@ -45,11 +45,17 @@ pub extern "C" fn sync_handler(frame: &Frame) {
     if esr >> 26 == 0b010101 {
         return svc::handle();
     }
+    if esr >> 26 == 0x24 || esr >> 26 == 0x25 {
+        return sched::dabt_handler();
+    }
     let far = arch::r_far_el1();
     let elr = arch::r_elr_el1();
     print!(
-        "sync... far = 0x{:x} erl: 0x{:x} ret pc: 0x{:x}\n",
-        far, elr, frame.pc
+        "sync... far = 0x{:x} erl: 0x{:x} ret pc: 0x{:x} esr: {:x}\n",
+        far,
+        elr,
+        frame.pc,
+        esr >> 26
     );
     let sp = arch::r_sp();
     let btm = unsafe { (&_boot_stack_btm) as *const u64 as u64 };

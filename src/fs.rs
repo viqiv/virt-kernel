@@ -112,6 +112,11 @@ impl File {
             self.offt.wrapping_sub(offt as usize)
         };
     }
+
+    pub fn dup(&mut self) -> Option<&'static mut Self> {
+        self.rc.fetch_add(1, Ordering::Release);
+        unsafe { (self as *const Self as *mut Self).as_mut() }
+    }
 }
 
 const NFILES: usize = 128;

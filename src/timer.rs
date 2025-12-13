@@ -73,8 +73,8 @@ pub fn init() {
 
 pub fn handle_tik() {
     let freq = r_freq();
-    print!("tik... {:x}\n", freq);
-    w_ptval_el0(freq / 10);
+    // print!("tik... {:x}\n", freq);
+    w_ptval_el0(freq / 100);
 
-    // sched::yild();
+    sched::yild();
 }

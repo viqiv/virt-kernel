@@ -55,7 +55,7 @@ fn main(b: usize, e: usize) {
     heap::init();
     trap::init();
     uart::init_rx();
-    // timer::init();
+    timer::init();
     // arch::pstate_i_clr();
     print!("bEGIN: {:x} End: {:x}\n", b, e);
     virtio::init();

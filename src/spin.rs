@@ -26,10 +26,9 @@ impl<T> Lock<T> {
     }
 
     pub fn acquire(&self) -> LockGuard<'_, T> {
-        let cur = unsafe { self.cpu.get().read() };
         let cpu = mycpu();
 
-        if cur == cpu {
+        if self.holding() {
             panic!("another lock {}", self.name);
         }
 
@@ -44,13 +43,20 @@ impl<T> Lock<T> {
         LockGuard(self)
     }
 
-    pub fn release(&self) {
-        self.locked.store(false, Ordering::Release);
+    pub fn holding(&self) -> bool {
         let cur = unsafe { self.cpu.get().read() };
         let cpu = mycpu();
-        assert!(cpu as *mut Cpu == cur);
-        cpu.enable_intr();
+        cpu as *mut Cpu == cur && self.locked.load(Ordering::Relaxed)
+    }
+
+    pub fn release(&self) {
+        assert!(self.holding());
+        // let cur = unsafe { self.cpu.get().read() };
+        let cpu = mycpu();
+        // assert!(cpu as *mut Cpu == cur);
+        self.locked.store(false, Ordering::Release);
         unsafe { self.cpu.get().write(0 as *mut Cpu) }
+        cpu.enable_intr();
     }
 }
 

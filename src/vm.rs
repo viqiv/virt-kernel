@@ -105,6 +105,8 @@ fn zero_pt_slice(ptr: &mut [u64]) {
 }
 
 fn pt_alloc_if_0(idx: usize, pt: &mut [u64]) -> &mut [u64] {
+    assert!(PT.holding());
+
     assert!(pt.len() == 512);
     let mut nxt_pt = pt[idx];
     if nxt_pt == 0 {
@@ -130,10 +132,10 @@ pub struct PmWrap {
 }
 
 impl PmWrap {
-    pub fn new(pm: usize, perms: u64, zero: bool) -> Result<PmWrap, ()> {
+    pub fn new(pm: usize, perms: u64, zero: bool) -> Result<PmWrap, Error> {
         let pm = pm & PHY_MASK;
         if pm < 0x4000_0000 {
-            return Err(());
+            return Err(Error::Inval);
         }
         let lock = FIXED_PAGES.acquire();
         if let Some(v) = lock.as_mut().alloc(1) {
@@ -149,7 +151,7 @@ impl PmWrap {
             }
             Ok(PmWrap { map: v })
         } else {
-            Err(())
+            Err(Error::Alloc)
         }
     }
 
@@ -161,13 +163,13 @@ impl PmWrap {
         as_slice_mut(self.map as *mut T, 4096 / size_of::<T>())
     }
 
-    // pub fn as_ref<T>(&self) -> &T {
-    //     unsafe { (self.map as *const T).as_ref() }.unwrap()
-    // }
+    pub fn as_ref<T>(&self) -> &T {
+        unsafe { (self.map as *const T).as_ref() }.unwrap()
+    }
 
-    // pub fn as_mut<T>(&self) -> &T {
-    //     unsafe { (self.map as *mut T).as_mut() }.unwrap()
-    // }
+    pub fn as_mut<T>(&self) -> &T {
+        unsafe { (self.map as *mut T).as_mut() }.unwrap()
+    }
 }
 
 impl Drop for PmWrap {
@@ -177,7 +179,7 @@ impl Drop for PmWrap {
     }
 }
 
-pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> Result<PmWrap, ()> {
+pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> Result<PmWrap, Error> {
     assert!(pt.len() == 512);
     let mut nxt_pt = pt[idx];
     let mut new = false;
@@ -228,7 +230,6 @@ fn region_perms(vaddr: u64) -> u64 {
     } else if vaddr >= rodata_end && vaddr < bss_end {
         return PR_PW;
     } else if vaddr >= bss_end && vaddr < user_end {
-        // loop {}
         return PR_PW_UR_UW_UX2;
     }
 
@@ -272,9 +273,16 @@ fn use_4k_blocks(l0_pt: &mut [u64], mut k_begin: usize, mut k_end: usize) {
 pub enum Error {
     Exists,
     Alloc,
+    Inval,
 }
 
-pub fn map_v2p_4k_inner(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Result<usize, Error> {
+pub fn map_v2p_4k_inner(
+    l0_pt: &mut [u64],
+    v: usize, //
+    p: usize,
+    perms: u64,
+    overw: bool,
+) -> Result<usize, Error> {
     let vaddr = Vaddr::new(v);
     let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt).map_err(|_| Error::Alloc)?;
     let l2_pt =
@@ -282,12 +290,21 @@ pub fn map_v2p_4k_inner(l0_pt: &mut [u64], v: usize, p: usize, perms: u64) -> Re
     let l3_pt =
         pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt.as_slice_mut()).map_err(|_| Error::Alloc)?;
 
+    let mut overwritten = false;
     if l3_pt.as_slice::<u64>()[vaddr.l3() as usize] != 0 {
-        return Err(Error::Exists);
+        if !overw {
+            return Err(Error::Exists);
+        } else {
+            overwritten = true;
+        }
     }
 
     l3_pt.as_slice_mut()[vaddr.l3() as usize] = (p as u64 | perms | 0x403) as u64;
     tlbi_vaee1(v as u64);
+
+    if overwritten {
+        return Err(Error::Exists);
+    }
     Ok(v)
 }
 
@@ -296,7 +313,7 @@ fn map_v2p_4k(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
 
-    map_v2p_4k_inner(l0_pt, v, p, perms)
+    map_v2p_4k_inner(l0_pt, v, p, perms, false)
 
     // let vaddr = Vaddr::new(v);
     // let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt);
@@ -322,56 +339,65 @@ fn map_v2p_4k2(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
 
-    map_v2p_4k_inner(l0_pt, v, p, perms)
+    map_v2p_4k_inner(l0_pt, v, p, perms, false)
 }
 
-fn walk_to_l3(l0_pt: &[u64], v: usize) -> Result<PmWrap, ()> {
+fn walk_to_l3(l0_pt: &[u64], v: usize) -> Result<PmWrap, Error> {
     let vaddr = Vaddr::new(v);
 
     let l1_pt = l0_pt[vaddr.l0() as usize];
 
     if l1_pt == 0 {
-        return Err(());
+        return Err(Error::Inval);
     }
 
-    let l1_pt = PmWrap::new(l1_pt as usize, PR, false).map_err(|_| ())?;
+    let l1_pt = PmWrap::new(l1_pt as usize, PR, false).map_err(|e| e)?;
     let l2_pt = l1_pt.as_slice::<u64>()[vaddr.l1() as usize];
 
     if l2_pt == 0 {
-        return Err(());
+        return Err(Error::Inval);
     }
 
-    let l2_pt = PmWrap::new(l2_pt as usize, PR, false).map_err(|_| ())?;
+    let l2_pt = PmWrap::new(l2_pt as usize, PR, false).map_err(|e| e)?;
     let l3_pt = l2_pt.as_slice::<u64>()[vaddr.l2() as usize];
 
     if l3_pt == 0 {
-        return Err(());
+        return Err(Error::Inval);
     }
 
-    let l3_pt = PmWrap::new(l3_pt as usize, PR_PW, false).map_err(|_| ())?;
+    let l3_pt = PmWrap::new(l3_pt as usize, PR_PW, false).map_err(|e| e)?;
     Ok(l3_pt)
 }
 
-pub fn v2p(v: usize) -> Result<usize, ()> {
-    let pt_lock = PT.acquire();
-    let l0_pt = &mut pt_lock.as_mut().data;
+pub fn v2p_pt<F: FnMut(*mut u64)>(l0_pt: &[u64], v: usize, cb: Option<F>) -> Result<usize, Error> {
     let vaddr = Vaddr::new(v);
-
-    let l3_pt = walk_to_l3(l0_pt, v).map_err(|_| ())?;
-    let paddr = l3_pt.as_slice::<u64>()[vaddr.l3() as usize];
-    Ok((paddr as usize & PHY_MASK) | (v & 0xfff))
+    let l3_pt = walk_to_l3(l0_pt, v).map_err(|e| e)?;
+    let ptr = &mut l3_pt.as_slice_mut::<u64>()[vaddr.l3() as usize];
+    if let Some(mut f) = cb {
+        f(ptr as *mut u64);
+    }
+    Ok((*ptr as usize & PHY_MASK) | (v & 0xfff))
 }
 
-pub fn unmap_4k(v: usize) -> Result<(), ()> {
+pub fn v2p(v: usize) -> Result<usize, Error> {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
+    v2p_pt::<fn(*mut u64)>(l0_pt, v, None)
+}
 
+pub fn unmap_4k_inner(l0_pt: &mut [u64], v: usize) -> Result<(), Error> {
     let vaddr = Vaddr::new(v);
-    let l3_pt = walk_to_l3(l0_pt, v).map_err(|_| ())?;
+    let l3_pt = walk_to_l3(l0_pt, v).map_err(|e| e)?;
     l3_pt.as_slice_mut::<u64>()[vaddr.l3() as usize] = 0;
 
     tlbi_vaee1(v as u64);
     Ok(())
+}
+
+pub fn unmap_4k(v: usize) -> Result<(), Error> {
+    let pt_lock = PT.acquire();
+    let l0_pt = &mut pt_lock.as_mut().data;
+    unmap_4k_inner(l0_pt, v)
 }
 
 fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
@@ -392,6 +418,7 @@ fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
 
             //HARDcoDE
             if paddr >= 0x40000000 && (pt[i] & 3) > 0 {
+                // print!("paddr: {:x}\n", paddr);
                 pm::free(paddr as usize);
             }
         }
@@ -420,7 +447,6 @@ pub fn init(k_begin: usize, k_end: usize) {
         *FIXED_L2.inner.get().cast::<u64>().add(v.l2() as usize) =
             ((FIXED_L3.inner.get()) as u64 - VOFFT) | 3
     };
-    // WRAP.set(());
 
     let neg1 = pt_lock.as_ref() as *const Table as u64 - VOFFT;
 
@@ -508,10 +534,6 @@ impl Region {
         self.bs.full()
     }
 
-    // fn is_uninit(&self) -> bool {
-    //     self.start == 0 && self.nxt.is_none() && self.bits == 0
-    // }
-
     fn nxt(&self) -> Option<NonNull<Region>> {
         match self.nxt {
             Some(ptr) => Some(ptr),
@@ -589,11 +611,6 @@ fn init_regions(start_p: usize) {
     first.start = 0xffff_ffff_fff0_0000;
 }
 
-// pub fn alloc_4k() -> Option<usize> {
-//     let lock = REGIONS.acquire();
-//     lock.as_mut().alloc(1)
-// }
-
 pub fn alloc(n: usize) -> Option<usize> {
     let lock = REGIONS.acquire();
     lock.as_mut().alloc(n)
@@ -611,25 +628,6 @@ pub fn free_4k(v: usize) {
     unmap_4k(v).unwrap();
 }
 
-// pub fn alloc_4k_direct() -> Option<usize> {
-//     let lock = DIRECTS.acquire();
-//     lock.as_mut().alloc(1)
-// }
-
-// pub fn free_4k_direct(v: usize) {
-//     let lock = DIRECTS.acquire();
-//     lock.as_mut().free_1(v)
-// }
-
-// fn map_4k(p: usize, perms: u64) -> Result<usize, Error> {
-//     match alloc_4k() {
-//         Some(v) => {
-//             map_v2p_4k(v, p, perms)
-//         },
-//         _ => Err(Error::Alloc),
-//     }
-// }
-
 pub fn map(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
     match alloc(n) {
         Some(v) => {
@@ -644,6 +642,7 @@ pub fn map(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
     }
 }
 
+//dbg
 pub fn map2(p: usize, n: usize, perms: u64) -> Result<usize, Error> {
     match alloc(n) {
         Some(v) => {

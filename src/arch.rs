@@ -20,6 +20,27 @@ pub fn r_pstate_daif() -> u64 {
 }
 
 #[inline]
+pub fn r_cpacr_el1() -> u64 {
+    let mut res = 0i64;
+    unsafe {
+        asm!("mrs {}, cpacr_el1", out(reg) res);
+    }
+    res.cast_unsigned() >> 28
+}
+
+#[inline]
+pub fn w_cpacr_el1(v: u64) {
+    unsafe {
+        asm!("msr cpacr_el1, {}", in(reg) v);
+    }
+}
+
+pub fn enable_fp() {
+    let cpacr = r_cpacr_el1();
+    w_cpacr_el1(cpacr | (3u64 << 20));
+}
+
+#[inline]
 pub fn r_pstate_cur_el() -> u64 {
     let mut res = 0i64;
     unsafe {
@@ -144,6 +165,22 @@ pub fn r_tcr_el1() -> u64 {
 pub fn w_tcr_el1(r: u64) {
     unsafe {
         asm!("msr tcr_el1, {}", in(reg) r);
+    }
+}
+
+#[inline]
+pub fn r_tpidrro_el0() -> u64 {
+    let mut res = 0i64;
+    unsafe {
+        asm!("mrs {}, tpidrro_el0", out(reg) res);
+    }
+    res.cast_unsigned()
+}
+
+#[inline]
+pub fn w_tpidrro_el0(r: u64) {
+    unsafe {
+        asm!("msr tpidrro_el0, {}", in(reg) r);
     }
 }
 

@@ -16,7 +16,7 @@ use alloc::{
 use crate::{
     arch::{
         pstate_i_clr, pstate_i_set, r_far_el1, r_pstate_daif, r_ttbr0_el1, tlbi_aside1, tlbi_vaee1,
-        w_ttbr0_el1,
+        w_tpidrro_el0, w_ttbr0_el1,
     },
     dsb,
     elf::{self, Elf, Elf64Phdr, PhIter},
@@ -116,6 +116,7 @@ pub struct Task {
     pid: u16,
     pub files: [Option<&'static mut fs::File>; 8],
     regions: RTree,
+    mappings: RTree,
 }
 
 unsafe impl Sync for Task {}
@@ -134,10 +135,11 @@ impl Task {
             pid: 0,
             files: [None, None, None, None, None, None, None, None],
             regions: BTreeMap::new(),
+            mappings: RTree::new(),
         }
     }
 
-    pub fn get_trap_frame(&self) -> Option<&mut trap::Frame> {
+    pub fn get_trap_frame(&self) -> Option<&'static mut trap::Frame> {
         unsafe { (self.trapframe as *mut trap::Frame).as_mut() }
     }
 
@@ -212,7 +214,6 @@ const SPEL0_SIZE: usize = 4096 * 2;
 
 pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), ()> {
     let mut new_regions = BTreeMap::<usize, Region>::new();
-
     let task = mycpu().get_task().unwrap();
     let user_pt = pm::alloc(4096).map_err(|_| ())?;
 
@@ -231,6 +232,7 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         if p.kind as u64 != elf::PT_LOAD {
             continue;
         }
+
         let len = align_f((p.vaddr as usize % 4096) + p.memsz as usize, 4096);
         let vfrom = align_b(p.vaddr as usize, 4096);
 
@@ -251,7 +253,7 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
                 } else if p.flags == elf::PF_R | elf::PF_W {
                     vm::PR_PW_UR_UW1
                 } else if p.flags == elf::PF_R {
-                    vm::PR_UR
+                    vm::PR_PW_UR_UW1
                 } else {
                     panic!("unhandled flags combo")
                 },
@@ -302,6 +304,45 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     let sp_el0 = sp_el0_w.as_slice_mut::<u8>();
     let mut w_idx = 4096;
     let btm = user_sp_region + 4096;
+
+    w_idx -= 16; //AT_RANDOM
+    let at_random = btm + w_idx;
+
+    #[repr(C)]
+    struct Aux {
+        k: u64,
+        v: u64,
+    }
+
+    let mut aux_ptr = (&mut sp_el0[w_idx]) as *mut u8 as *mut Aux;
+    let mut aux_ref = unsafe { aux_ptr.as_mut() }.unwrap();
+    let _ = aux_ref;
+
+    {
+        if w_idx < 16 {
+            return Err(());
+        }
+        unsafe {
+            aux_ptr = aux_ptr.sub(1);
+            aux_ref = aux_ptr.as_mut().unwrap();
+            aux_ref.k = 0;
+            aux_ref.v = 0;
+        }
+        w_idx -= 16;
+    }
+
+    {
+        if w_idx < 16 {
+            return Err(());
+        }
+        unsafe {
+            aux_ptr = aux_ptr.sub(1);
+            aux_ref = aux_ptr.as_mut().unwrap();
+            aux_ref.k = 25;
+            aux_ref.v = at_random as u64;
+        }
+        w_idx -= 16;
+    }
 
     let mut s = Vec::new();
     s.push(0); // envp null term
@@ -354,7 +395,7 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         return Err(());
     }
 
-    let ptrs_len = 8 * s.len();
+    let ptrs_len = 8 * (s.len() + 1);
     if w_idx < ptrs_len {
         return Err(());
     }
@@ -367,6 +408,9 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     let sp_pos = (btm + 4096) - (ptrs_len + (4096 - w_idx));
     w_idx = 0;
 
+    ptrs[w_idx] = if argv.len() > 0 { argv.len() } else { 1 };
+    w_idx += 1;
+
     while let Some(ptr) = s.pop() {
         ptrs[w_idx] = ptr as usize;
         w_idx += 1;
@@ -378,9 +422,9 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     tf.pstate = 0x0;
     tf.sp_el0 = sp_pos as u64;
 
-    tf.regs[0] = if argv.len() > 0 { argv.len() as u64 } else { 1 };
-    tf.regs[1] = sp_pos as u64;
-    tf.regs[2] = sp_pos as u64 + (argv.len() as u64 + 1) * 8 as u64;
+    // tf.regs[0] = if argv.len() > 0 { argv.len() as u64 } else { 1 };
+    // tf.regs[1] = sp_pos as u64;
+    // tf.regs[2] = sp_pos as u64 + (argv.len() as u64 + 1) * 8 as u64;
 
     free_pt(task.user_pt.unwrap());
 
@@ -399,6 +443,176 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     // .unwrap();
     restore_ttbr0(task.pid as usize, user_pt as usize);
     Ok(())
+}
+
+pub fn brk() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let last = task.regions.last_key_value().unwrap();
+    let pos = (last.0 + last.1.len) as u64;
+
+    let new_pos = tf.regs[0];
+
+    if new_pos == 0 {
+        return pos;
+    }
+
+    if new_pos < pos {
+        return !0;
+    }
+
+    if new_pos == pos {
+        return pos;
+    }
+
+    let incr = align_f(new_pos as usize - pos as usize, 4096);
+
+    let region = alloc_region(&mut task.regions, incr as usize, elf::PF_R | elf::PF_W);
+    if region.is_none() {
+        return !0;
+    }
+    let region = region.unwrap();
+
+    let def = defer(|| {
+        task.regions.pop_last();
+    });
+
+    let p = pm::alloc(incr as usize);
+    if p.is_err() {
+        unreachable!();
+        // return !0;
+    }
+    let p = p.unwrap();
+
+    let def2 = defer(|| {
+        pm::free(p);
+    });
+
+    let l0_pt = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false);
+    if l0_pt.is_err() {
+        return !0;
+    }
+
+    let l0_pt = l0_pt.unwrap();
+
+    return match map(
+        l0_pt.as_slice_mut(),
+        region,
+        p,
+        incr / 4096,
+        vm::PR_PW_UR_UW1,
+    ) {
+        Ok(_) => {
+            forget(def2);
+            forget(def);
+            new_pos
+        }
+        _ => !0,
+    };
+
+    // panic!("brk({});", incr);
+}
+
+pub fn settid() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    task.pid as u64
+}
+
+pub fn set_robust_list() -> u64 {
+    0
+}
+
+pub fn rseq() -> u64 {
+    !0
+}
+
+pub fn prlimit64() -> u64 {
+    0
+}
+
+const MAPPINGS_BEGIN: usize = GB;
+
+pub fn mprotect() -> u64 {
+    0
+}
+
+pub fn mmap() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let flags = tf.regs[3];
+    // print!("mmap+++++++++\n");
+
+    // TODO
+    if (flags & 0x20) == 0 {
+        return !0;
+    }
+
+    let len = align_f(tf.regs[1] as usize, 4096);
+
+    // TODO
+    if len.count_ones() != 1 {
+        return !0;
+    }
+
+    // print!(
+    //     "mmap flags = {:x} prot = {:x} len = {}\n",
+    //     flags, tf.regs[2], len
+    // );
+
+    let p = pm::alloc(len as usize);
+    if p.is_err() {
+        return !0;
+    }
+    let p = p.unwrap();
+
+    let def = defer(|| {
+        pm::free(p);
+    });
+
+    let x = tf.regs[2];
+    let region = alloc_region(
+        &mut task.mappings, //
+        len as usize,
+        x as u32,
+    );
+
+    if region.is_none() {
+        return !0;
+    }
+    let region = region.unwrap() + MAPPINGS_BEGIN;
+
+    let def2 = defer(|| {
+        task.regions.pop_last();
+    });
+
+    let perms = if tf.regs[2] == 1 {
+        vm::PR_UR
+    } else if tf.regs[2] == 3 {
+        vm::PR_PW_UR_UW1
+    } else if tf.regs[2] == 5 {
+        vm::PR_UR_UX
+    } else if tf.regs[2] == 0 {
+        return region as u64;
+    } else {
+        panic!("mmap: unknown perms: {}\n", tf.regs[2]);
+    };
+
+    let l0_pt = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false);
+    if l0_pt.is_err() {
+        return !0;
+    }
+
+    let l0_pt = l0_pt.unwrap();
+
+    return match map(l0_pt.as_slice_mut(), region, p, len as usize / 4096, perms) {
+        Ok(_) => {
+            forget(def2);
+            forget(def);
+            region as u64
+        }
+        _ => !0,
+    };
+    // panic!("mmap {:?}\n", tf);
 }
 
 fn clone_regions(
@@ -554,6 +768,9 @@ static WAIT: Lock<()> = Lock::new("wait", ());
 
 pub fn exit() -> u64 {
     let task = mycpu().get_task().unwrap();
+    if task.pid == 0 {
+        panic!("pid 0 tried to exit");
+    }
     let wait_lock = WAIT.acquire();
 
     if let Some(p) = task.parent {
@@ -568,6 +785,10 @@ pub fn exit() -> u64 {
     sched();
     let _ = lock;
     0
+}
+
+pub fn exit_group() -> u64 {
+    exit()
 }
 
 pub fn wait() -> u64 {
@@ -720,6 +941,7 @@ pub fn dabt_handler() {
     //TODO segfaultonomy
     print!("======================\n");
     print!("Dabt.. at {:x} pid {}\n", vaddr, task.pid);
+    print!("{:?}\n", task.get_trap_frame().unwrap());
     print!("======================\n");
     loop {}
 }
@@ -900,9 +1122,10 @@ pub extern "C" fn forkret() {
 
     restore_ttbr0(task.pid as usize, task.user_pt.unwrap() as usize);
 
+    w_tpidrro_el0(0xff0);
     if FIRST.swap(false, Ordering::Release) {
+        print!("launching init..\n");
         execv("main", &["main\0".as_ptr()], &["FOO:bar\0".as_ptr()]).unwrap();
-        print!("FIRST SHIT!\n");
     }
 
     unsafe {

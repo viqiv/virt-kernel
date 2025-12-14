@@ -208,6 +208,24 @@ pub fn sys_read() -> u64 {
     }
 }
 
+pub fn readlinkat() -> u64 {
+    0
+}
+
+pub fn getrandom() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    tf.regs[1]
+}
+
+pub fn fstat() -> u64 {
+    !0
+}
+
+pub fn lseek() -> u64 {
+    !0
+}
+
 static FS: Lock<Fs> = Lock::new(
     "fs",
     Fs {

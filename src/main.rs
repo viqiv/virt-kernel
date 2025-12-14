@@ -8,9 +8,7 @@ use core::{
     cell::UnsafeCell,
 };
 
-use alloc::vec::Vec;
-
-use crate::{arch::pstate_i_clr, heap::SyncUnsafeCell, sched::mycpu};
+use crate::{arch::enable_fp, heap::SyncUnsafeCell};
 
 mod arch;
 mod blk;
@@ -31,7 +29,7 @@ mod uart;
 mod virtio;
 mod vm;
 
-static BUF: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell(UnsafeCell::new([0; 512]));
+// static BUF: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell(UnsafeCell::new([0; 512]));
 
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
@@ -59,7 +57,7 @@ fn main(b: usize, e: usize) {
     // arch::pstate_i_clr();
     print!("bEGIN: {:x} End: {:x}\n", b, e);
     virtio::init();
-
+    enable_fp();
     sched::create_task(task as *const fn() as u64);
     sched::scheduler();
 

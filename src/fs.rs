@@ -1,4 +1,10 @@
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::{
+    ffi::{c_int, c_long, c_uint, c_ulong},
+    marker::PhantomData,
+    sync::atomic::{AtomicU16, Ordering},
+};
+
+use alloc::str;
 
 use crate::{
     cons::{self},
@@ -6,7 +12,7 @@ use crate::{
     p9, print,
     sched::mycpu,
     spin::Lock,
-    stuff::{as_slice, as_slice_mut},
+    stuff::{as_slice, as_slice_mut, cstr_as_slice},
 };
 
 pub enum FileKind {
@@ -224,6 +230,45 @@ pub fn fstat() -> u64 {
 
 pub fn lseek() -> u64 {
     !0
+}
+
+pub fn newfsstatat() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let fd = tf.regs[0];
+
+    let path = cstr_as_slice(tf.regs[1] as *const u8);
+    print!("path = {:?}\n", str::from_utf8(path).unwrap());
+
+    panic!("fd = {}\n", fd);
+}
+
+pub const AT_FDCWD: i32 = -100;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct stat {
+    pub st_dev: c_ulong,
+    pub st_ino: c_ulong,
+    pub st_mode: c_uint,
+    pub st_nlink: c_uint,
+    pub st_uid: c_uint,
+    pub st_gid: c_uint,
+    pub st_rdev: c_ulong,
+    pub __pad1: c_ulong,
+    pub st_size: c_long,
+    pub st_blksize: c_int,
+    pub __pad2: c_int,
+    pub st_blocks: c_long,
+    pub st_atime: c_long,
+    pub st_atime_nsec: c_ulong,
+    pub st_mtime: c_long,
+    pub st_mtime_nsec: c_ulong,
+    pub st_ctime: c_long,
+    pub st_ctime_nsec: c_ulong,
+    pub __unused4: c_uint,
+    pub __unused5: c_uint,
 }
 
 static FS: Lock<Fs> = Lock::new(

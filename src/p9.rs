@@ -1053,7 +1053,7 @@ mod ops {
         Ok(count)
     }
 
-    pub fn stat(fid: u32, sync: bool) -> Result<Stat, ()> {
+    pub fn stat(fid: u32) -> Result<Stat, ()> {
         let lock = P9L.acquire();
         let p9 = lock.as_mut();
 
@@ -1107,15 +1107,9 @@ mod ops {
         let regs = unsafe { p9.regs.unwrap().as_mut() };
         virtio::set_ready(regs, 0);
         virtio::notify_q(regs, 0);
+        let _ = old;
 
-        if sync {
-            p9.q.wait_use(old);
-            p9.q.pop_used();
-            let irq_s = get_irq_status(regs);
-            irq_ack(regs, irq_s);
-        } else {
-            sleep(msg.get_self_ptr(), lock.get_lock());
-        }
+        sleep(msg.get_self_ptr(), lock.get_lock());
 
         msg.seek(4);
         let resp_kind = msg.read_u8().unwrap();
@@ -1233,6 +1227,18 @@ pub fn open(path: &str, mode: u32) -> Result<&'static mut File, ()> {
             file.iou = iou;
             file.qid = qid;
             return Ok(file);
+        } else {
+            return Err(());
+        }
+    };
+
+    Err(())
+}
+
+pub fn stat(path: &str) -> Result<Stat, ()> {
+    if let Ok((fid, _)) = ops::walk(path) {
+        if let Ok(s) = ops::stat(fid) {
+            return Ok(s);
         } else {
             return Err(());
         }

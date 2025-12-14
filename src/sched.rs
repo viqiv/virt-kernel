@@ -10,6 +10,7 @@ use core::{
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
+    string::String,
     vec::Vec,
 };
 
@@ -117,6 +118,7 @@ pub struct Task {
     pub files: [Option<&'static mut fs::File>; 8],
     regions: RTree,
     mappings: RTree,
+    pub cwd: Option<String>,
 }
 
 unsafe impl Sync for Task {}
@@ -136,6 +138,7 @@ impl Task {
             files: [None, None, None, None, None, None, None, None],
             regions: BTreeMap::new(),
             mappings: RTree::new(),
+            cwd: None,
         }
     }
 
@@ -253,7 +256,7 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
                 } else if p.flags == elf::PF_R | elf::PF_W {
                     vm::PR_PW_UR_UW1
                 } else if p.flags == elf::PF_R {
-                    vm::PR_PW_UR_UW1
+                    vm::PR_UR
                 } else {
                     panic!("unhandled flags combo")
                 },
@@ -753,7 +756,10 @@ static WAIT: Lock<()> = Lock::new("wait", ());
 pub fn exit() -> u64 {
     let task = mycpu().get_task().unwrap();
     if task.pid == 0 {
-        panic!("pid 0 tried to exit");
+        panic!(
+            "pid 0 tried to exit {}\n",
+            task.get_trap_frame().unwrap().regs[0]
+        );
     }
     let wait_lock = WAIT.acquire();
 
@@ -773,6 +779,10 @@ pub fn exit() -> u64 {
 
 pub fn exit_group() -> u64 {
     exit()
+}
+
+pub fn getuid() -> u64 {
+    1000
 }
 
 pub fn wait() -> u64 {
@@ -1106,10 +1116,11 @@ pub extern "C" fn forkret() {
 
     restore_ttbr0(task.pid as usize, task.user_pt.unwrap() as usize);
 
-    // w_tpidrro_el0(0xff0);
+    w_tpidrro_el0(0xff0);
     if FIRST.swap(false, Ordering::Release) {
         print!("launching init..\n");
         execv("init", &[], &[]).unwrap();
+        task.cwd = Some("/".into());
     }
 
     unsafe {

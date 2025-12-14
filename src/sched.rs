@@ -379,17 +379,6 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         s.push(btm + w_idx);
     }
 
-    if w_idx == 4095 {
-        if path.len() + 1 > w_idx {
-            return Err(());
-        }
-        w_idx -= 1;
-        sp_el0[w_idx] = 0;
-        w_idx -= path.len();
-        sp_el0[w_idx..w_idx + path.len()].copy_from_slice(path.as_bytes());
-        s.push(btm + w_idx);
-    }
-
     w_idx = align_b(w_idx, 8);
     if w_idx < 8 {
         return Err(());
@@ -408,7 +397,7 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     let sp_pos = (btm + 4096) - (ptrs_len + (4096 - w_idx));
     w_idx = 0;
 
-    ptrs[w_idx] = if argv.len() > 0 { argv.len() } else { 1 };
+    ptrs[w_idx] = argv.len();
     w_idx += 1;
 
     while let Some(ptr) = s.pop() {
@@ -421,10 +410,6 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     tf.pc = elf.header.entry;
     tf.pstate = 0x0;
     tf.sp_el0 = sp_pos as u64;
-
-    // tf.regs[0] = if argv.len() > 0 { argv.len() as u64 } else { 1 };
-    // tf.regs[1] = sp_pos as u64;
-    // tf.regs[2] = sp_pos as u64 + (argv.len() as u64 + 1) * 8 as u64;
 
     free_pt(task.user_pt.unwrap());
 
@@ -540,7 +525,6 @@ pub fn mmap() -> u64 {
     let task = mycpu().get_task().unwrap();
     let tf = task.get_trap_frame().unwrap();
     let flags = tf.regs[3];
-    // print!("mmap+++++++++\n");
 
     // TODO
     if (flags & 0x20) == 0 {
@@ -1122,10 +1106,10 @@ pub extern "C" fn forkret() {
 
     restore_ttbr0(task.pid as usize, task.user_pt.unwrap() as usize);
 
-    w_tpidrro_el0(0xff0);
+    // w_tpidrro_el0(0xff0);
     if FIRST.swap(false, Ordering::Release) {
         print!("launching init..\n");
-        execv("main", &["main\0".as_ptr()], &["FOO:bar\0".as_ptr()]).unwrap();
+        execv("init", &[], &[]).unwrap();
     }
 
     unsafe {

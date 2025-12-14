@@ -9,12 +9,12 @@ qemu-system-aarch64 \
     -device virtio-rng-device \
     -fsdev local,id=fs0,path=/home/m/Desktop/dbg,security_model=mapped-xattr \
     -device virtio-9p-device,fsdev=fs0,mount_tag=sh0 \
-    -drive file=/home/m/Desktop/raspi.img,if=none,id=hd0,format=raw \
-    -device virtio-blk-device,drive=hd0 \
     -global virtio-mmio.force-legacy=false \
     # -S -s
 
 
+    # -drive file=/home/m/Desktop/raspi.img,if=none,id=hd0,format=raw \
+    # -device virtio-blk-device,drive=hd0 \
 # (qemu) info mtree
 # address-space: virtio-net-pci
 #   0000000000000000-ffffffffffffffff (prio 0, i/o): bus master container

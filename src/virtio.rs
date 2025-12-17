@@ -411,6 +411,7 @@ impl<const N: usize> Q<N> {
         let mut i = 1;
         while let Some(nidx) = d.get_next() {
             assert!(i < N);
+            assert!(self.desc_bs.tst(nidx as u8));
             self.desc_bs.clr(nidx as u8);
             d = self.get_desc(nidx as usize);
             i += 1;

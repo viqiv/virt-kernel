@@ -59,6 +59,27 @@ impl BitSet128 {
 
         None
     }
+
+    #[inline]
+    pub fn set_nclr(&mut self, n: u8) -> Option<u8> {
+        let mut f = 0;
+        let mut b = self.back;
+        for i in 0..self.len() {
+            if !self.tst(i) {
+                b |= 1u128 << i;
+                f += 1;
+            } else {
+                f = 0;
+                b = self.back;
+            }
+            if f == n {
+                self.back = b;
+                let idx = i - (n - 1);
+                return Some(idx as u8);
+            }
+        }
+        None
+    }
 }
 
 pub fn as_slice_mut<'a, T>(ptr: *mut T, len: usize) -> &'a mut [T] {
@@ -78,8 +99,22 @@ pub fn strlen(ptr: *const u8) -> usize {
     return 0;
 }
 
+pub fn strlen64(ptr: *const u64) -> usize {
+    for i in 0.. {
+        if unsafe { ptr.add(i).read() == 0 } {
+            return i;
+        }
+    }
+    return 0;
+}
+
 pub fn cstr_as_slice<'a>(ptr: *const u8) -> &'a [u8] {
     let len = strlen(ptr);
+    as_slice(ptr, len)
+}
+
+pub fn cstr64_as_slice<'a>(ptr: *const u64) -> &'a [u64] {
+    let len = strlen64(ptr);
     as_slice(ptr, len)
 }
 

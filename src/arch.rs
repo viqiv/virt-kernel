@@ -185,6 +185,22 @@ pub fn w_tpidrro_el0(r: u64) {
 }
 
 #[inline]
+pub fn r_tpidr_el0() -> u64 {
+    let mut res = 0i64;
+    unsafe {
+        asm!("mrs {}, tpidr_el0", out(reg) res);
+    }
+    res.cast_unsigned()
+}
+
+#[inline]
+pub fn w_tpidr_el0(r: u64) {
+    unsafe {
+        asm!("msr tpidr_el0, {}", in(reg) r);
+    }
+}
+
+#[inline]
 pub fn r_ttbr0_el1() -> u64 {
     let mut res = 0i64;
     unsafe {

@@ -1,9 +1,12 @@
+use alloc::collections::linked_list::LinkedList;
+
 use crate::{
     _bss_end, _data_end, _rodata_end, _text_end, _user_end,
     arch::{self, tlbi_vaee1},
     dsb, isb,
     pm::{GB, KB, MB},
     print,
+    sched::{self},
     stuff::{BitSet128, as_slice, as_slice_mut, defer},
     tlbi_vmalle1,
 };
@@ -179,7 +182,11 @@ impl Drop for PmWrap {
     }
 }
 
-pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> Result<PmWrap, Error> {
+pub fn pt_alloc_if_0_2<F: FnMut(&mut [u64])>(
+    idx: usize,
+    pt: &mut [u64],
+    new_cb: &mut F,
+) -> Result<PmWrap, Error> {
     assert!(pt.len() == 512);
     let mut nxt_pt = pt[idx];
     let mut new = false;
@@ -195,6 +202,11 @@ pub fn pt_alloc_if_0_2(idx: usize, pt: &mut [u64]) -> Result<PmWrap, Error> {
     }
 
     let nxt_pt = PmWrap::new(nxt_pt as usize, PR_PW, new);
+    if new {
+        if let Ok(npt) = &nxt_pt {
+            new_cb(npt.as_slice_mut());
+        }
+    }
     nxt_pt
 }
 
@@ -271,29 +283,31 @@ fn use_4k_blocks(l0_pt: &mut [u64], mut k_begin: usize, mut k_end: usize) {
 
 #[derive(Debug)]
 pub enum Error {
-    Exists,
+    #[allow(dead_code)]
+    Exists(usize),
     Alloc,
     Inval,
 }
 
-pub fn map_v2p_4k_inner(
+pub fn map_v2p_4k_inner<F: FnMut(&mut [u64])>(
     l0_pt: &mut [u64],
     v: usize, //
     p: usize,
     perms: u64,
     overw: bool,
+    mut ncb: F,
 ) -> Result<usize, Error> {
     let vaddr = Vaddr::new(v);
-    let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt).map_err(|_| Error::Alloc)?;
-    let l2_pt =
-        pt_alloc_if_0_2(vaddr.l1() as usize, l1_pt.as_slice_mut()).map_err(|_| Error::Alloc)?;
-    let l3_pt =
-        pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt.as_slice_mut()).map_err(|_| Error::Alloc)?;
+    let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt, &mut ncb).map_err(|_| Error::Alloc)?;
+    let l2_pt = pt_alloc_if_0_2(vaddr.l1() as usize, l1_pt.as_slice_mut(), &mut ncb)
+        .map_err(|_| Error::Alloc)?;
+    let l3_pt = pt_alloc_if_0_2(vaddr.l2() as usize, l2_pt.as_slice_mut(), &mut ncb)
+        .map_err(|_| Error::Alloc)?;
 
     let mut overwritten = false;
     if l3_pt.as_slice::<u64>()[vaddr.l3() as usize] != 0 {
         if !overw {
-            return Err(Error::Exists);
+            return Err(Error::Exists(v));
         } else {
             overwritten = true;
         }
@@ -303,7 +317,7 @@ pub fn map_v2p_4k_inner(
     tlbi_vaee1(v as u64);
 
     if overwritten {
-        return Err(Error::Exists);
+        return Err(Error::Exists(v));
     }
     Ok(v)
 }
@@ -313,7 +327,7 @@ fn map_v2p_4k(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
 
-    map_v2p_4k_inner(l0_pt, v, p, perms, false)
+    map_v2p_4k_inner(l0_pt, v, p, perms, false, |_| {})
 
     // let vaddr = Vaddr::new(v);
     // let l1_pt = pt_alloc_if_0_2(vaddr.l0() as usize, l0_pt);
@@ -339,7 +353,7 @@ fn map_v2p_4k2(v: usize, p: usize, perms: u64) -> Result<usize, Error> {
     let pt_lock = PT.acquire();
     let l0_pt = &mut pt_lock.as_mut().data;
 
-    map_v2p_4k_inner(l0_pt, v, p, perms, false)
+    map_v2p_4k_inner(l0_pt, v, p, perms, false, |_| {})
 }
 
 fn walk_to_l3(l0_pt: &[u64], v: usize) -> Result<PmWrap, Error> {
@@ -499,20 +513,6 @@ impl Vaddr {
     }
 }
 
-impl Display for Vaddr {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "[l0: {}, l1: {}, l2: {}, l3: {}, offt: {}]",
-            self.l0(),
-            self.l1(),
-            self.l2(),
-            self.l3(),
-            self.offt()
-        )
-    }
-}
-
 pub struct Region {
     start: usize,
     bs: BitSet128,
@@ -550,14 +550,14 @@ impl Region {
     }
 
     fn alloc(&mut self, n: usize) -> Option<usize> {
-        if self.is_full() || n != 1 {
+        if self.is_full() || n > 4 {
             // TODO append if full
             return None;
         }
 
-        match self.bs.first_clr() {
+        match self.bs.set_nclr(n as u8) {
             Some(i) => {
-                self.bs.set(i);
+                // self.bs.set(i);
                 Some(i as usize * 4096 + self.start)
             }
             _ => None,
@@ -585,16 +585,6 @@ impl Region {
         if self.free_inner(addr).is_some() {
             return;
         }
-
-        // let mut last = self;
-        // while let Some(mut nxt) = last.nxt() {
-        //     let tmp = unsafe { nxt.as_mut() };
-        //     if let Some(_) = tmp.free_inner(addr) {
-        //         return;
-        //     }
-        //     last = tmp;
-        // }
-        print!("addr: 0x{:x} self.start: 0x{:x}\n", addr, self.start);
         unreachable!()
     }
 }

@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicU16, Ordering},
 };
 
-use alloc::str;
+use alloc::{str, string::String};
 
 use crate::{
     cons::{self},
@@ -123,6 +123,14 @@ impl File {
         self.rc.fetch_add(1, Ordering::Release);
         unsafe { (self as *const Self as *mut Self).as_mut() }
     }
+
+    pub fn read_all(&mut self, mut buf: &mut [u8]) -> Result<(), ()> {
+        while buf.len() > 0 {
+            let n = self.read(buf).map_err(|_| ())?;
+            buf = &mut buf[n..];
+        }
+        Ok(())
+    }
 }
 
 const NFILES: usize = 128;
@@ -215,7 +223,23 @@ pub fn sys_read() -> u64 {
 }
 
 pub fn readlinkat() -> u64 {
-    0
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let fd = tf.regs[0];
+
+    let path = cstr_as_slice(tf.regs[1] as *const u8);
+    let path_str = String::from(str::from_utf8(path).unwrap());
+
+    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
+        let mut cwd = task.cwd.as_ref().unwrap().clone();
+        cwd.push_str(&path_str);
+        cwd
+    } else {
+        path_str
+    };
+
+    !0
 }
 
 pub fn getrandom() -> u64 {
@@ -232,6 +256,49 @@ pub fn lseek() -> u64 {
     !0
 }
 
+pub fn ioctl() -> u64 {
+    !0
+}
+
+pub fn openat() -> u64 {
+    !0
+}
+
+pub fn fcntl() -> u64 {
+    0
+}
+
+pub fn ppoll() -> u64 {
+    !0
+}
+
+pub fn close() -> u64 {
+    !0
+}
+
+pub fn dup3() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let old_fd = tf.regs[0] as usize;
+    let new_fd = tf.regs[1] as usize;
+
+    if task.files[old_fd].is_none() {
+        return !0;
+    }
+
+    if task.files[new_fd].is_some() {
+        task.files[old_fd].as_mut().unwrap().close().unwrap();
+    }
+
+    let file = task.files[old_fd].as_mut().unwrap();
+    task.files[new_fd] = file.dup();
+
+    0
+}
+
+pub const AT_SYMLINK_NOFOLLOW: u32 = 256;
+
 pub fn newfsstatat() -> u64 {
     let task = mycpu().get_task().unwrap();
     let tf = task.get_trap_frame().unwrap();
@@ -239,9 +306,37 @@ pub fn newfsstatat() -> u64 {
     let fd = tf.regs[0];
 
     let path = cstr_as_slice(tf.regs[1] as *const u8);
-    print!("path = {:?}\n", str::from_utf8(path).unwrap());
+    let path_str = String::from(str::from_utf8(path).unwrap());
 
-    panic!("fd = {}\n", fd);
+    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
+        let mut cwd = task.cwd.as_ref().unwrap().clone();
+        cwd.push_str(&path_str);
+        cwd
+    } else {
+        path_str
+    };
+
+    // print!("=====================fstat {} {}\n", real_path, tf.regs[3]);
+    match p9::stat(&real_path, tf.regs[3] as u32 & AT_SYMLINK_NOFOLLOW > 0) {
+        Ok(s) => {
+            let stat = unsafe { (tf.regs[2] as *mut stat).as_mut() }.unwrap();
+            stat.st_dev = s.dev as u64;
+            stat.st_size = s.len as i64;
+            stat.st_atime = s.atime as i64;
+            stat.st_mtime = s.mtime as i64;
+            stat.st_mode = s.mode;
+            stat.st_uid = 0;
+            stat.st_gid = 0;
+            stat.st_nlink = 2;
+            stat.st_blocks = 8;
+            stat.st_blksize = 4096;
+            stat.st_ctime = 0;
+            return 0;
+        }
+        _ => return !0,
+    }
+
+    // panic!("fd = {}\n", fd);
 }
 
 pub const AT_FDCWD: i32 = -100;

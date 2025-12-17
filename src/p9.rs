@@ -1235,9 +1235,19 @@ pub fn open(path: &str, mode: u32) -> Result<&'static mut File, ()> {
     Err(())
 }
 
-pub fn stat(path: &str) -> Result<Stat, ()> {
-    if let Ok((fid, _)) = ops::walk(path) {
-        if let Ok(s) = ops::stat(fid) {
+pub fn stat(path: &str, _: bool) -> Result<Stat, ()> {
+    if let Ok((fid, qid)) = ops::walk(path) {
+        if let Ok(mut s) = ops::stat(fid) {
+            s.mode |= match s.qid.kind {
+                QIDKind::DIR => 0x4000,
+                QIDKind::APPEND => todo!(),
+                QIDKind::EXCL => todo!(),
+                QIDKind::MOUNT => todo!(),
+                QIDKind::AUTH => todo!(),
+                QIDKind::TMP => todo!(),
+                QIDKind::SYMLINK => 0xA000,
+                QIDKind::LINK | QIDKind::FILE => 0x8000,
+            };
             return Ok(s);
         } else {
             return Err(());

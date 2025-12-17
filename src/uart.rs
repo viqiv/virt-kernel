@@ -26,6 +26,7 @@ pub struct Writer;
 
 impl core::fmt::Write for Writer {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        #[cfg(feature = "dbg")]
         write_bytes(s.as_bytes(), unsafe { MAP.0.get().read() });
         Ok(())
     }

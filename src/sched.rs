@@ -1,43 +1,36 @@
 use core::{
     arch::{asm, naked_asm},
     cmp::min,
-    hint::spin_loop,
     mem::forget,
-    ops::Sub,
-    ptr::slice_from_raw_parts_mut,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use alloc::{
-    collections::{btree_map::BTreeMap, vec_deque::VecDeque},
-    string::String,
-    vec::Vec,
-};
+use alloc::{collections::linked_list::LinkedList, string::String, vec::Vec};
 
 use crate::{
     arch::{
-        pstate_i_clr, pstate_i_set, r_far_el1, r_pstate_daif, r_ttbr0_el1, tlbi_aside1, tlbi_vaee1,
-        w_tpidrro_el0, w_ttbr0_el1,
+        pstate_i_clr, pstate_i_set, r_far_el1, r_pstate_daif, r_tpidr_el0, r_tpidrro_el0,
+        tlbi_aside1, w_tpidr_el0, w_ttbr0_el1,
     },
     dsb,
     elf::{self, Elf, Elf64Phdr, PhIter},
-    fs::{self, File, open},
+    fs::{self, File},
     heap::SyncUnsafeCell,
     isb, p9,
-    pm::{self, Flags, GB, align_b, align_f},
+    pm::{self, GB, MB, align_b, align_f},
     print,
     spin::Lock,
-    stuff::{BitSet128, as_slice_mut, cstr_as_slice, defer},
+    stuff::{as_slice, as_slice_mut, cstr_as_slice, cstr64_as_slice, defer},
     tlbi_vmalle1, trap,
-    vm::{self, PmWrap, Vaddr, free_pt, map_v2p_4k_inner, unmap_4k_inner, v2p, v2p_pt},
-    wfe, wfi,
+    vm::{self, PmWrap, free_pt, map_v2p_4k_inner, unmap_4k_inner, v2p, v2p_pt},
+    wfi,
 };
 
 pub struct Cpu {
     int_enable: bool,
     pub int_disables: u32,
     task_idx: Option<usize>,
-    shed_ctx: [u64; 14],
+    shed_ctx: [u64; 15],
 }
 
 unsafe impl Sync for Cpu {}
@@ -75,7 +68,7 @@ static CPUS: SyncUnsafeCell<[Cpu; NCPU]> = SyncUnsafeCell::new([Cpu {
     int_enable: false,
     int_disables: 0,
     task_idx: None,
-    shed_ctx: [0; 14],
+    shed_ctx: [0; 15],
 }]);
 
 fn cpuid() -> usize {
@@ -98,26 +91,79 @@ enum State {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Region {
-    len: usize,
-    flags: u32,
+enum RegionType {
+    Program,
+    Stack,
+    Brk,
+    Mmap,
 }
 
-type RTree = BTreeMap<usize, Region>;
+const REGION_MAX_SZ: usize = GB;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Region {
+    ty: RegionType,
+    pub vaddr: usize,
+    cap: usize,
+    pub len: usize,
+    pub flags: u32,
+    pub granule: u8,
+}
+
+impl Region {
+    pub fn calc_granule(block_size: usize) -> u8 {
+        assert!(block_size.count_ones() == 1);
+        assert!(block_size >= 4096 && block_size <= MB);
+        ((block_size / 4096) - 1) as u8
+    }
+
+    pub fn blksize(&self) -> usize {
+        4096 << self.granule as usize
+    }
+
+    pub fn blksize2(granule: u8) -> usize {
+        4096 << granule as usize
+    }
+
+    pub fn has(&self, vaddr: usize) -> bool {
+        vaddr >= self.vaddr && vaddr < (self.vaddr + self.len)
+    }
+
+    pub fn end(&self) -> usize {
+        self.len + self.vaddr
+    }
+
+    pub fn alloc(&mut self, sz: usize) -> Option<usize> {
+        assert!(sz % self.blksize() == 0);
+        if self.len + sz > self.vaddr + REGION_MAX_SZ {
+            None
+        } else {
+            let res = self.vaddr + self.len;
+            self.len += sz;
+            Some(res)
+        }
+    }
+}
+
+pub type RTree = LinkedList<Region>;
 
 pub struct Task {
-    parent: Option<*const Task>,
+    parent: Option<*mut Task>,
     exit_code: u64,
+    tid: Option<u64>,
     state: State,
-    ctx: [u64; 14],
+    ctx: [u64; 15],
     lock: Lock<()>,
     pub trapframe: u64,
     user_pt: Option<u64>,
+    user_sp: Option<u64>,
     chan: Option<u64>,
-    pid: u16,
+    pub pid: u16,
     pub files: [Option<&'static mut fs::File>; 8],
-    regions: RTree,
-    mappings: RTree,
+    program: RTree,
+    mmap: Region,
+    brk: Region,
+    spel0: Region,
     pub cwd: Option<String>,
 }
 
@@ -128,16 +174,41 @@ impl Task {
         Task {
             parent: None,
             exit_code: 0,
+            tid: None,
             state: State::Free,
-            ctx: [0; 14],
+            ctx: [0; 15],
             lock: Lock::new("T", ()),
             trapframe: 0,
             user_pt: None,
+            user_sp: None,
             chan: None,
             pid: 0,
             files: [None, None, None, None, None, None, None, None],
-            regions: BTreeMap::new(),
-            mappings: RTree::new(),
+            program: RTree::new(),
+            mmap: Region {
+                ty: RegionType::Mmap,
+                vaddr: GB,
+                cap: REGION_MAX_SZ,
+                len: 0,
+                flags: elf::PF_R | elf::PF_W,
+                granule: 0,
+            },
+            brk: Region {
+                ty: RegionType::Brk,
+                vaddr: 2 * GB,
+                cap: REGION_MAX_SZ,
+                len: 0,
+                flags: elf::PF_R | elf::PF_W,
+                granule: 0,
+            },
+            spel0: Region {
+                ty: RegionType::Stack,
+                vaddr: 8 * GB,
+                cap: SPEL0_SIZE,
+                len: SPEL0_SIZE,
+                flags: elf::PF_R | elf::PF_W,
+                granule: 1,
+            },
             cwd: None,
         }
     }
@@ -149,10 +220,23 @@ impl Task {
     fn init_1(&mut self, pc: u64) {
         let user_pt = pm::alloc(4096).unwrap() as u64;
         self.user_pt = Some(user_pt);
-        let _ = PmWrap::new(self.user_pt.unwrap() as usize, vm::PR_PW, true).unwrap();
+        let l0_pt = PmWrap::new(self.user_pt.unwrap() as usize, vm::PR_PW, true).unwrap();
+        let user_sp = pm::alloc(SPEL0_SIZE).unwrap();
 
-        let sp_el1 = pm::alloc(4096).unwrap();
-        let sp_el1 = vm::map(sp_el1, 1, vm::PR_PW).unwrap() + 4096;
+        map(
+            l0_pt.as_slice_mut(),
+            self.spel0.vaddr,
+            user_sp,
+            self.spel0.len / 4096,
+            vm::PR_PW_UR_UW1,
+        ) //
+        .unwrap();
+
+        self.user_sp = Some(user_sp as u64);
+
+        let sp_el1 = pm::alloc(4096 * 2).unwrap();
+        let sp_el1 = vm::map(sp_el1, 2, vm::PR_PW).unwrap();
+        let sp_el1 = sp_el1 + 4096 * 2;
 
         let tf_ptr = unsafe { (sp_el1 as *mut trap::Frame).sub(1) };
         let tf = unsafe { tf_ptr.as_mut().unwrap() };
@@ -169,7 +253,15 @@ impl Task {
 
 fn map(l0_pt: &mut [u64], v: usize, p: usize, n: usize, perms: u64) -> Result<usize, vm::Error> {
     for i in 0..n {
-        map_v2p_4k_inner(l0_pt, v + (4096 * i), p + (4096 * i), perms, false).map_err(|e| e)?;
+        map_v2p_4k_inner(
+            l0_pt,
+            v + (4096 * i),
+            p + (4096 * i),
+            perms,
+            false,
+            |_pt| {},
+        )
+        .map_err(|e| e)?;
     }
     Ok(v)
 }
@@ -195,36 +287,44 @@ fn map_ovwr(
             p + (4096 * i), //
             perms,
             true,
+            |_| {},
         ) {
-            Err(vm::Error::Exists) => {}
+            Err(vm::Error::Exists(_)) => {}
             e => return e,
         };
     }
     Ok(v)
 }
 
-fn alloc_region(r: &mut RTree, len: usize, flags: u32) -> Option<usize> {
-    if let Some((k, v)) = r.last_key_value() {
-        let free_begin = align_f(k + v.len, 4096);
-        r.insert(free_begin, Region { len, flags });
-        Some(free_begin)
-    } else {
-        None
+fn map_chg_perms(l0_pt: &mut [u64], v: usize, n: usize, perms: u64) -> Result<usize, vm::Error> {
+    for i in 0..n {
+        v2p_pt(
+            l0_pt,
+            v + (4096 * i),
+            Some(|ptr: *mut u64| unsafe {
+                *ptr = (*ptr & vm::PHY_MASK as u64) | perms | 0x403;
+            }),
+        )
+        .unwrap();
     }
+    Ok(v)
 }
 
 const SPEL0_SIZE: usize = 4096 * 2;
 
-pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), ()> {
-    let mut new_regions = BTreeMap::<usize, Region>::new();
+// inplace
+pub fn execv_inner(path: &str, argv: &[&[u8]], envp: &[&[u8]], skipr: bool) -> Result<(), ()> {
     let task = mycpu().get_task().unwrap();
-    let user_pt = pm::alloc(4096).map_err(|_| ())?;
 
-    let defer_user_pt = defer(|| {
-        vm::free_pt(user_pt as u64);
-    });
+    let user_pt = task.user_pt.unwrap();
 
-    let l0_pt = PmWrap::new(user_pt as usize, vm::PR_PW, true).unwrap();
+    let l0_pt = PmWrap::new(user_pt as usize, vm::PR_PW, false).unwrap();
+    free_region(&task.mmap, l0_pt.as_slice_mut(), false);
+    task.mmap.len = 0;
+    free_region(&task.brk, l0_pt.as_slice_mut(), false);
+    task.brk.len = 0;
+    free_regions(&mut task.program, l0_pt.as_slice_mut(), false).unwrap();
+    task.program.clear();
 
     let mut elf = Elf::new(path).map_err(|_| ())?;
 
@@ -238,78 +338,99 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
 
         let len = align_f((p.vaddr as usize % 4096) + p.memsz as usize, 4096);
         let vfrom = align_b(p.vaddr as usize, 4096);
-
         let pages = len / 4096;
-        let mut wofft = p.vaddr;
         for i in 0..pages {
-            let pm = pm::alloc(4096).map_err(|_| ())?;
-            let defer_pm = defer(|| {
-                crate::pm::free(pm as usize);
-            });
+            let pm = pm::alloc(4096).unwrap();
             map(
                 l0_pt.as_slice_mut(),
-                vfrom + i * 4096,
+                vfrom + i * 4096, //
                 pm,
                 1,
-                if p.flags == elf::PF_R | elf::PF_X {
-                    vm::PR_UR_UX
-                } else if p.flags == elf::PF_R | elf::PF_W {
-                    vm::PR_PW_UR_UW1
-                } else if p.flags == elf::PF_R {
-                    vm::PR_UR
-                } else {
-                    panic!("unhandled flags combo")
-                },
+                vm::PR_PW,
             )
-            .map_err(|_| ())?;
-            forget(defer_pm);
-
-            let vm = PmWrap::new(pm, vm::PR_PW, false).map_err(|_| ())?;
-            let buf_offt = wofft as usize % 4096;
-            let written = wofft - p.vaddr;
-            let buf = &mut vm.as_slice_mut::<u8>()
-                [buf_offt..buf_offt + min(4096 - buf_offt, p.filesz as usize - written as usize)];
-
-            file.seek_to(p.offset as usize + written as usize);
-
-            let n = file.read(buf).map_err(|_| ())?;
-            if n != buf.len() as usize {
-                return Err(());
-            }
-
-            wofft += n as u64;
+            .unwrap();
         }
 
-        new_regions.insert(
+        tlbi_aside1(task.pid as u64);
+        dsb!();
+        isb!();
+
+        let slice = as_slice_mut(p.vaddr as *mut u8, p.memsz as usize);
+        file.seek_to(p.offset as usize);
+        file.read_all(&mut slice[0..p.filesz as usize]).unwrap();
+        (&mut slice[p.filesz as usize..]).fill(0);
+
+        task.program.push_back(Region {
+            vaddr: vfrom,
+            len,
+            flags: p.flags,
+            granule: 0,
+            cap: len,
+            ty: RegionType::Program,
+        });
+
+        map_chg_perms(
+            l0_pt.as_slice_mut(),
             vfrom,
-            Region {
-                len,
-                flags: p.flags,
+            pages,
+            if p.flags == elf::PF_R | elf::PF_X {
+                vm::PR_UR_UX
+            } else if p.flags == elf::PF_R | elf::PF_W {
+                vm::PR_PW_UR_UW1
+            } else if p.flags == elf::PF_R {
+                vm::PR_UR
+            } else {
+                panic!("unhandled flags combo")
             },
-        );
+        )
+        .unwrap();
     }
 
-    let user_sp = pm::alloc(SPEL0_SIZE).map_err(|_| ())?;
-    let defer_user_sp = defer(|| {
-        pm::free(user_sp as usize);
-    });
+    let sp_el0 = as_slice_mut(task.spel0.vaddr as *mut u8, task.spel0.len);
+    sp_el0.fill(0);
 
-    let user_sp_region = alloc_region(
-        &mut new_regions,
-        SPEL0_SIZE, //
-        elf::PF_R | elf::PF_W,
-    )
-    .unwrap();
-
-    forget(defer_user_sp);
-
-    let sp_el0_w = PmWrap::new(user_sp + 4096, vm::PR_PW, true).map_err(|_| ())?;
-    let sp_el0 = sp_el0_w.as_slice_mut::<u8>();
-    let mut w_idx = 4096;
-    let btm = user_sp_region + 4096;
-
+    let mut w_idx = SPEL0_SIZE;
+    macro_rules! curptr {
+        () => {
+            &sp_el0[w_idx] as *const u8 as u64
+        };
+    }
     w_idx -= 16; //AT_RANDOM
-    let at_random = btm + w_idx;
+    let at_random = curptr!();
+
+    let mut s = Vec::new();
+    s.push(0); // envp null term
+    for i in 0..envp.len() {
+        let slice = envp[envp.len() - i - 1];
+        if slice.len() == 0 {
+            break;
+        }
+        if slice.len() + 1 > w_idx {
+            return Err(());
+        }
+        w_idx -= 1;
+        sp_el0[w_idx] = 0;
+        w_idx -= slice.len();
+        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
+        s.push(curptr!());
+    }
+
+    s.push(0); // argv null term
+
+    for i in 0..argv.len() {
+        let slice = argv[argv.len() - i - 1];
+        if slice.len() == 0 {
+            break;
+        }
+        if slice.len() + 1 > w_idx {
+            return Err(());
+        }
+        w_idx -= 1;
+        sp_el0[w_idx] = 0;
+        w_idx -= slice.len();
+        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
+        s.push(curptr!());
+    }
 
     #[repr(C)]
     struct Aux {
@@ -317,89 +438,40 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
         v: u64,
     }
 
+    w_idx = align_b(w_idx, 8);
     let mut aux_ptr = (&mut sp_el0[w_idx]) as *mut u8 as *mut Aux;
     let mut aux_ref = unsafe { aux_ptr.as_mut() }.unwrap();
     let _ = aux_ref;
 
-    {
-        if w_idx < 16 {
-            return Err(());
-        }
-        unsafe {
-            aux_ptr = aux_ptr.sub(1);
-            aux_ref = aux_ptr.as_mut().unwrap();
-            aux_ref.k = 0;
-            aux_ref.v = 0;
-        }
-        w_idx -= 16;
+    macro_rules! auxv {
+        ($k:expr, $v:expr) => {{
+            if w_idx < 16 {
+                return Err(());
+            }
+            unsafe {
+                aux_ptr = aux_ptr.sub(1);
+                aux_ref = aux_ptr.as_mut().unwrap();
+                aux_ref.k = $k;
+                aux_ref.v = $v;
+            }
+            w_idx -= 16;
+        }};
     }
 
-    {
-        if w_idx < 16 {
-            return Err(());
-        }
-        unsafe {
-            aux_ptr = aux_ptr.sub(1);
-            aux_ref = aux_ptr.as_mut().unwrap();
-            aux_ref.k = 25;
-            aux_ref.v = at_random as u64;
-        }
-        w_idx -= 16;
-    }
-
-    let mut s = Vec::new();
-    s.push(0); // envp null term
-
-    for i in 0..envp.len() {
-        let slice = cstr_as_slice(envp[envp.len() - i - 1]);
-        if slice.len() == 0 {
-            break;
-        }
-        if slice.len() + 1 > w_idx {
-            return Err(());
-        }
-        w_idx -= 1;
-        sp_el0[w_idx] = 0;
-        w_idx -= slice.len();
-        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
-        s.push(btm + w_idx);
-    }
-
-    s.push(0); // argv null term
-
-    for i in 0..argv.len() {
-        let slice = cstr_as_slice(argv[argv.len() - i - 1]);
-        if slice.len() == 0 {
-            break;
-        }
-        if slice.len() + 1 > w_idx {
-            return Err(());
-        }
-        w_idx -= 1;
-        sp_el0[w_idx] = 0;
-        w_idx -= slice.len();
-        sp_el0[w_idx..w_idx + slice.len()].copy_from_slice(slice);
-        s.push(btm + w_idx);
-    }
-
-    w_idx = align_b(w_idx, 8);
-    if w_idx < 8 {
-        return Err(());
-    }
+    auxv!(0, 0);
+    auxv!(25, at_random as u64);
 
     let ptrs_len = 8 * (s.len() + 1);
     if w_idx < ptrs_len {
         return Err(());
     }
+    w_idx -= ptrs_len;
 
-    let ptrs = as_slice_mut(
-        &sp_el0[w_idx - ptrs_len] as *const u8 as *mut usize,
-        ptrs_len,
-    );
+    let ptrs = as_slice_mut(&mut sp_el0[w_idx] as *mut u8 as *mut usize, ptrs_len / 8);
 
-    let sp_pos = (btm + 4096) - (ptrs_len + (4096 - w_idx));
+    let sp_pos = curptr!();
+
     w_idx = 0;
-
     ptrs[w_idx] = argv.len();
     w_idx += 1;
 
@@ -409,96 +481,103 @@ pub fn execv(path: &str, argv: &[*const u8], envp: &[*const u8]) -> Result<(), (
     }
 
     let tf = unsafe { (task.trapframe as *mut trap::Frame).as_mut() }.unwrap();
+    tf.zero();
 
     tf.pc = elf.header.entry;
     tf.pstate = 0x0;
     tf.sp_el0 = sp_pos as u64;
 
-    free_pt(task.user_pt.unwrap());
-
-    forget(defer_user_pt);
-
-    task.regions = new_regions;
-    task.user_pt = Some(user_pt as u64);
-    map(
-        l0_pt.as_slice_mut(),
-        user_sp_region,
-        user_sp,
-        SPEL0_SIZE / 4096,
-        vm::PR_PW_UR_UW1,
-    ) //
-    .map_err(|_| ())?;
-    // .unwrap();
     restore_ttbr0(task.pid as usize, user_pt as usize);
+    w_tpidr_el0(0);
     Ok(())
+}
+
+pub fn execve() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let path = cstr_as_slice(tf.regs[0] as *const u8);
+    let path = Vec::from(path);
+
+    let pathstr = match str::from_utf8(path.as_slice()) {
+        Ok(p) => p,
+        _ => return !0,
+    };
+
+    let argv_ptr = cstr64_as_slice(tf.regs[1] as *const u64);
+    let envp_ptr = cstr64_as_slice(tf.regs[2] as *const u64);
+
+    let mut argv = Vec::new();
+    let mut envp = Vec::new();
+
+    let mut all = Vec::new();
+
+    for i in 0..argv_ptr.len() {
+        let cstr = cstr_as_slice(argv_ptr[i] as *const u8);
+        let vec = Vec::from(cstr);
+        argv.push(as_slice(vec.as_ptr(), vec.len()));
+        all.push(vec);
+    }
+
+    for i in 0..envp_ptr.len() {
+        let cstr = cstr_as_slice(envp_ptr[i] as *const u8);
+        let vec = Vec::from(cstr);
+        envp.push(as_slice(vec.as_ptr(), vec.len()));
+        all.push(vec);
+    }
+
+    let ret = match execv_inner(pathstr, &argv.as_slice(), &envp.as_slice(), true) {
+        Ok(_) => 0,
+        _ => !0,
+    };
+
+    ret
 }
 
 pub fn brk() -> u64 {
     let task = mycpu().get_task().unwrap();
     let tf = task.get_trap_frame().unwrap();
-    let last = task.regions.last_key_value().unwrap();
-    let pos = (last.0 + last.1.len) as u64;
+    let pos = task.brk.end() as u64;
 
-    let new_pos = tf.regs[0];
+    let new_pos = align_f(tf.regs[0] as usize, 4096) as u64;
 
     if new_pos == 0 {
         return pos;
     }
 
     if new_pos < pos {
-        return !0;
+        return pos;
     }
 
     if new_pos == pos {
         return pos;
     }
 
-    let incr = align_f(new_pos as usize - pos as usize, 4096);
-
-    let region = alloc_region(&mut task.regions, incr as usize, elf::PF_R | elf::PF_W);
-    if region.is_none() {
-        return !0;
-    }
-    let region = region.unwrap();
-
-    let def = defer(|| {
-        task.regions.pop_last();
-    });
-
-    let p = pm::alloc(incr as usize);
-    if p.is_err() {
-        unreachable!();
-        // return !0;
-    }
-    let p = p.unwrap();
-
-    let def2 = defer(|| {
-        pm::free(p);
-    });
-
-    let l0_pt = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false);
-    if l0_pt.is_err() {
-        return !0;
+    let incr = (new_pos - pos) as usize;
+    if incr > 10 * MB {
+        return pos;
     }
 
-    let l0_pt = l0_pt.unwrap();
+    let region = task.brk.alloc(incr).unwrap();
 
-    return match map(
-        l0_pt.as_slice_mut(),
-        region,
-        p,
-        incr / 4096,
-        vm::PR_PW_UR_UW1,
-    ) {
-        Ok(_) => {
-            forget(def2);
-            forget(def);
-            new_pos
-        }
-        _ => !0,
-    };
+    let pages = incr / 4096;
+    let l0_pt = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false).unwrap();
 
-    // panic!("brk({});", incr);
+    for i in 0..pages {
+        let v = region + i * 4096;
+        let p = pm::alloc(4096).unwrap();
+        match map(l0_pt.as_slice_mut(), v, p, 1, vm::PR_PW_UR_UW1) {
+            Err(_) => {
+                todo!();
+            }
+            _ => {}
+        };
+    }
+
+    let slice = as_slice_mut(pos as *mut u8, incr);
+    slice.fill(0x0);
+
+    new_pos
 }
 
 pub fn settid() -> u64 {
@@ -518,8 +597,6 @@ pub fn prlimit64() -> u64 {
     0
 }
 
-const MAPPINGS_BEGIN: usize = GB;
-
 pub fn mprotect() -> u64 {
     0
 }
@@ -536,41 +613,11 @@ pub fn mmap() -> u64 {
 
     let len = align_f(tf.regs[1] as usize, 4096);
 
-    // TODO
-    if len.count_ones() != 1 {
+    if len > 10 * MB {
         return !0;
     }
 
-    // print!(
-    //     "mmap flags = {:x} prot = {:x} len = {}\n",
-    //     flags, tf.regs[2], len
-    // );
-
-    let p = pm::alloc(len as usize);
-    if p.is_err() {
-        return !0;
-    }
-    let p = p.unwrap();
-
-    let def = defer(|| {
-        pm::free(p);
-    });
-
-    let x = tf.regs[2];
-    let region = alloc_region(
-        &mut task.mappings, //
-        len as usize,
-        x as u32,
-    );
-
-    if region.is_none() {
-        return !0;
-    }
-    let region = region.unwrap() + MAPPINGS_BEGIN;
-
-    let def2 = defer(|| {
-        task.regions.pop_last();
-    });
+    let region = task.mmap.alloc(len).unwrap();
 
     let perms = if tf.regs[2] == 1 {
         vm::PR_UR
@@ -578,8 +625,6 @@ pub fn mmap() -> u64 {
         vm::PR_PW_UR_UW1
     } else if tf.regs[2] == 5 {
         vm::PR_UR_UX
-    } else if tf.regs[2] == 0 {
-        return region as u64;
     } else {
         panic!("mmap: unknown perms: {}\n", tf.regs[2]);
     };
@@ -591,15 +636,63 @@ pub fn mmap() -> u64 {
 
     let l0_pt = l0_pt.unwrap();
 
-    return match map(l0_pt.as_slice_mut(), region, p, len as usize / 4096, perms) {
-        Ok(_) => {
-            forget(def2);
-            forget(def);
-            region as u64
-        }
-        _ => !0,
+    let pages = len / 4096;
+
+    for i in 0..pages {
+        let v = region + i * 4096;
+        let p = pm::alloc(4096).unwrap();
+
+        match map(l0_pt.as_slice_mut(), v, p, 1, perms) {
+            Err(_) => {
+                todo!()
+            }
+            _ => {}
+        };
+    }
+    let slice = as_slice_mut(region as *mut u8, len);
+    slice.fill(0x0);
+    region as u64
+}
+
+pub fn munmap() -> u64 {
+    0
+}
+
+fn clone_region(region: &Region, from_pt: &mut [u64], to_pt: &mut [u64]) {
+    assert!(region.vaddr % 4096 == 0 && region.len % 4096 == 0);
+    assert!(region.len % region.blksize() == 0);
+    let flags = if region.flags == elf::PF_R | elf::PF_X {
+        // 0
+        vm::PR_UR_UX
+    } else if region.flags == elf::PF_R | elf::PF_W {
+        // 0
+        vm::PR_UR
+    } else if region.flags == elf::PF_R {
+        // 0
+        vm::PR_UR
+    } else {
+        panic!("unhandled flags combo")
     };
-    // panic!("mmap {:?}\n", tf);
+
+    let n = region.len / region.blksize();
+    for i in 0..n {
+        let closure = |ent: *mut u64| unsafe {
+            *ent = (*ent & vm::PHY_MASK as u64) | flags | 0x403;
+        };
+        let cl = COW.acquire();
+        let vm = region.vaddr + (i * region.blksize());
+        let pm = v2p_pt(from_pt, vm, Some(closure)).unwrap();
+        let pm_page = pm::lookup(pm).unwrap();
+        assert!(pm_page.len() == region.blksize());
+        assert!(pm_page.ref_cnt > 0);
+        let pages = pm_page.len() / 4096;
+        map(to_pt, vm, pm, pages, flags).unwrap();
+        for j in 1..pages {
+            v2p_pt(from_pt, vm + 4096 * j, Some(closure)).unwrap();
+        }
+        pm_page.dup_for_cow();
+        drop(cl);
+    }
 }
 
 fn clone_regions(
@@ -609,47 +702,9 @@ fn clone_regions(
     to_pt: &mut [u64],
 ) -> Result<(), ()> {
     let mut fit = from.iter();
-    while let Some((k, v)) = fit.next() {
-        assert!(k % 4096 == 0 && v.len % 4096 == 0);
-        let flags = if v.flags == elf::PF_R | elf::PF_X {
-            // 0
-            vm::PR_UR_UX
-        } else if v.flags == elf::PF_R | elf::PF_W {
-            // 0
-            vm::PR_UR
-        } else if v.flags == elf::PF_R {
-            // 0
-            vm::PR_UR
-        } else {
-            panic!("unhandled flags combo")
-        };
-
-        let n = v.len / 4096;
-        let mut i = 0;
-        while i < n {
-            let closure = |ent: *mut u64| unsafe {
-                *ent = (*ent & vm::PHY_MASK as u64) | flags | 0x403;
-            };
-            let vm = *k + (i * 4096);
-            let pm = v2p_pt(from_pt, vm, Some(closure)).map_err(|_| ())?;
-            let pm_page = pm::lookup(pm);
-            if pm_page.is_none() {
-                return Err(());
-            }
-            let pm_page = pm_page.unwrap();
-            if pm_page.ref_cnt == 0 {
-                return Err(());
-            }
-            let pages = pm_page.len() / 4096;
-            map(to_pt, vm, pm, pages, flags).map_err(|_| ())?;
-            for j in 1..pages {
-                v2p_pt(from_pt, vm + 4096 * j, Some(closure)).map_err(|_| ())?;
-            }
-            i += pages;
-            pm_page.dup_for_cow();
-        }
-
-        to.insert(*k, *v);
+    while let Some(region) = fit.next() {
+        clone_region(region, from_pt, to_pt);
+        to.push_back(*region);
     }
 
     Ok(())
@@ -657,25 +712,136 @@ fn clone_regions(
 
 pub fn fork() -> u64 {
     let task = mycpu().get_task().unwrap();
-    if let Some(new_task) = alloc_task() {
-        let defer = defer(|| if let Ok(_) = free_task(new_task.pid as usize) {});
-        let from = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false);
-        if from.is_err() {
-            return !0;
-        }
-        let to = PmWrap::new(new_task.user_pt.unwrap() as usize, vm::PR_PW, false);
-        if to.is_err() {
-            return !0;
-        }
+    let tf = task.get_trap_frame().unwrap();
+    let flags64 = tf.regs[0];
+    let mut set_tid = false;
+    let mut clear_tid = false;
 
-        if let Err(_) = clone_regions(
-            &task.regions,
-            &mut new_task.regions, //
-            from.unwrap().as_slice_mut(),
-            to.unwrap().as_slice_mut(),
-        ) {
-            return !0;
-        }
+    if flags64 & SIGCHLD as u64 != 0 {
+        // todo!("flag SIGGCHLD is not implemented");
+    }
+    if flags64 & CLONE_VM as u64 != 0 {
+        todo!("flag CLONE_VM is not implemented");
+    }
+    if flags64 & CLONE_FS as u64 != 0 {
+        todo!("flag CLONE_FS is not implemented");
+    }
+    if flags64 & CLONE_FILES as u64 != 0 {
+        todo!("flag CLONE_FILES is not implemented");
+    }
+    if flags64 & CLONE_SIGHAND as u64 != 0 {
+        todo!("flag CLONE_SIGHAND is not implemented");
+    }
+    if flags64 & CLONE_PIDFD as u64 != 0 {
+        todo!("flag CLONE_PIDFD is not implemented");
+    }
+    if flags64 & CLONE_PTRACE as u64 != 0 {
+        todo!("flag CLONE_PTRACE is not implemented");
+    }
+    if flags64 & CLONE_VFORK as u64 != 0 {
+        todo!("flag CLONE_VFORK is not implemented");
+    }
+    if flags64 & CLONE_PARENT as u64 != 0 {
+        todo!("flag CLONE_PARENT is not implemented");
+    }
+    if flags64 & CLONE_THREAD as u64 != 0 {
+        todo!("flag CLONE_THREAD is not implemented");
+    }
+    if flags64 & CLONE_NEWNS as u64 != 0 {
+        todo!("flag CLONE_NEWNS is not implemented");
+    }
+    if flags64 & CLONE_SYSVSEM as u64 != 0 {
+        todo!("flag CLONE_SYSVSEM is not implemented");
+    }
+    if flags64 & CLONE_SETTLS as u64 != 0 {
+        todo!("flag CLONE_SETTLS is not implemented");
+    }
+    if flags64 & CLONE_PARENT_SETTID as u64 != 0 {
+        todo!("flag CLONE_PARENT_SETTID is not implemented");
+    }
+    if flags64 & CLONE_CHILD_CLEARTID as u64 != 0 {
+        clear_tid = true;
+        // todo!("flag CLONE_CHILD_CLEARTID is not implemented");
+    }
+    if flags64 & CLONE_DETACHED as u64 != 0 {
+        todo!("flag CLONE_DETACHED is not implemented");
+    }
+    if flags64 & CLONE_UNTRACED as u64 != 0 {
+        todo!("flag CLONE_UNTRACED is not implemented");
+    }
+    if flags64 & CLONE_CHILD_SETTID as u64 != 0 {
+        set_tid = true;
+        // todo!("flag CLONE_CHILD_SETTID is not implemented");
+    }
+    if flags64 & CLONE_NEWCGROUP as u64 != 0 {
+        todo!("flag CLONE_NEWCGROUP is not implemented");
+    }
+    if flags64 & CLONE_NEWUTS as u64 != 0 {
+        todo!("flag CLONE_NEWUTS is not implemented");
+    }
+    if flags64 & CLONE_NEWIPC as u64 != 0 {
+        todo!("flag CLONE_NEWIPC is not implemented");
+    }
+    if flags64 & CLONE_NEWUSER as u64 != 0 {
+        todo!("flag CLONE_NEWUSER is not implemented");
+    }
+    if flags64 & CLONE_NEWPID as u64 != 0 {
+        todo!("flag CLONE_NEWPID is not implemented");
+    }
+    if flags64 & CLONE_NEWNET as u64 != 0 {
+        todo!("flag CLONE_NEWNET is not implemented");
+    }
+    if flags64 & CLONE_IO as u64 != 0 {
+        todo!("flag CLONE_IO is not implemented");
+    }
+    if flags64 & CLONE_CLEAR_SIGHAND != 0 {
+        todo!("flag CLONE_CLEAR_SIGHAND is not implemented");
+    }
+    if flags64 & CLONE_INTO_CGROUP != 0 {
+        todo!("flag CLONE_INTO_CGROUP is not implemented");
+    }
+    if flags64 & CLONE_NEWTIME as u64 != 0 {
+        todo!("flag CLONE_NEWTIME is not implemented");
+    }
+
+    // unsigned long clone_flags,
+    // unsigned long newsp,
+    // int *parent_tidptr,
+    // unsigned long tls,
+    // int *child_tidptr
+
+    let child_tidptr = tf.regs[4] as *mut u32;
+
+    if let Some(new_task) = alloc_task() {
+        assert!(new_task.lock.holding());
+
+        let from = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false).unwrap();
+        let to = PmWrap::new(new_task.user_pt.unwrap() as usize, vm::PR_PW, false).unwrap();
+
+        clone_regions(
+            &task.program,
+            &mut new_task.program, //
+            from.as_slice_mut(),
+            to.as_slice_mut(),
+        )
+        .unwrap();
+
+        clone_region(&task.brk, from.as_slice_mut(), to.as_slice_mut());
+        clone_region(&task.mmap, from.as_slice_mut(), to.as_slice_mut());
+
+        new_task.brk = task.brk;
+        new_task.mmap = task.mmap;
+
+        copy_pm(
+            task.user_sp.unwrap() as usize,
+            new_task.user_sp.unwrap() as usize,
+            2,
+        )
+        .unwrap();
+
+        tlbi_aside1(task.pid as u64);
+        dsb!();
+        isb!();
 
         for i in 0..task.files.len() {
             if let Some(f) = &mut task.files[i] {
@@ -684,47 +850,86 @@ pub fn fork() -> u64 {
         }
 
         let nt = new_task.get_trap_frame().unwrap();
-        let ot = task.get_trap_frame().unwrap();
-        *nt = *ot;
+        *nt = *tf;
 
         nt.regs[0] = 0;
-        tlbi_aside1(task.pid as u64);
-        dsb!();
-        isb!();
+
+        new_task.ctx[14] = r_tpidr_el0();
+        task.ctx[14] = r_tpidr_el0();
+
         new_task.state = State::Ready;
-        new_task.parent = Some(task as *const Task);
-        forget(defer);
-        new_task.pid as u64
+
+        let wlock = WAIT.acquire();
+        new_task.parent = Some(task as *mut Task);
+        drop(wlock);
+
+        let pid = new_task.pid as u64;
+        if set_tid {
+            unsafe { *child_tidptr = new_task.pid as u32 }
+        }
+
+        if clear_tid {
+            new_task.tid = Some(tf.regs[4]);
+        }
+        new_task.lock.release();
+        pid
     } else {
         !0
     }
 }
 
-fn free_regions(regions: &mut RTree, l0_pt: &mut [u64]) -> Result<(), vm::Error> {
-    let mut rit = regions.iter();
-    while let Some((k, v)) = rit.next() {
-        let n = v.len / 4096;
-        let mut i = 0;
-        while i < n {
-            let vm = *k + (i * 4096);
-            let pm = v2p_pt::<fn(*mut u64)>(l0_pt, vm, None).map_err(|e| e)?;
-            let pm_page = pm::lookup(pm);
-            if pm_page.is_none() {
-                return Err(vm::Error::Inval);
-            }
-            let pm_page = pm_page.unwrap();
-            if pm_page.ref_cnt == 0 {
-                return Err(vm::Error::Inval);
-            }
-            match pm_page.flags {
-                pm::Flags::Used | pm::Flags::Cow => {}
-                _ => return Err(vm::Error::Inval),
-            }
-            let pages = pm_page.len() / 4096;
-            unmap(l0_pt, vm, pages).map_err(|e| e)?;
-            crate::pm::free(pm);
-            i += pages;
+pub const SIGCHLD: u32 = 17;
+pub const CLONE_VM: u32 = 256;
+pub const CLONE_FS: u32 = 512;
+pub const CLONE_FILES: u32 = 1024;
+pub const CLONE_SIGHAND: u32 = 2048;
+pub const CLONE_PIDFD: u32 = 4096;
+pub const CLONE_PTRACE: u32 = 8192;
+pub const CLONE_VFORK: u32 = 16384;
+pub const CLONE_PARENT: u32 = 32768;
+pub const CLONE_THREAD: u32 = 65536;
+pub const CLONE_NEWNS: u32 = 131072;
+pub const CLONE_SYSVSEM: u32 = 262144;
+pub const CLONE_SETTLS: u32 = 524288;
+pub const CLONE_PARENT_SETTID: u32 = 1048576;
+pub const CLONE_CHILD_CLEARTID: u32 = 2097152;
+pub const CLONE_DETACHED: u32 = 4194304;
+pub const CLONE_UNTRACED: u32 = 8388608;
+pub const CLONE_CHILD_SETTID: u32 = 16777216;
+pub const CLONE_NEWCGROUP: u32 = 33554432;
+pub const CLONE_NEWUTS: u32 = 67108864;
+pub const CLONE_NEWIPC: u32 = 134217728;
+pub const CLONE_NEWUSER: u32 = 268435456;
+pub const CLONE_NEWPID: u32 = 536870912;
+pub const CLONE_NEWNET: u32 = 1073741824;
+pub const CLONE_IO: u32 = 2147483648;
+pub const CLONE_CLEAR_SIGHAND: u64 = 4294967296;
+pub const CLONE_INTO_CGROUP: u64 = 8589934592;
+pub const CLONE_NEWTIME: u32 = 128;
+pub const CLONE_ARGS_SIZE_VER0: u32 = 64;
+pub const CLONE_ARGS_SIZE_VER1: u32 = 80;
+pub const CLONE_ARGS_SIZE_VER2: u32 = 88;
+
+fn free_region(region: &Region, l0_pt: &mut [u64], skip: bool) {
+    let n = region.len / region.blksize();
+    assert!(region.len % region.blksize() == 0);
+    for i in 0..n {
+        let v = region.vaddr + i * region.blksize();
+        let p = v2p_pt::<fn(*mut u64)>(l0_pt, v, None).unwrap();
+        let pm_page = pm::lookup(p).unwrap();
+        assert!(pm_page.ref_cnt > 0);
+        assert_eq!(pm_page.len(), region.blksize());
+        if !skip {
+            pm::free(p);
         }
+        unmap(l0_pt, v, region.blksize() / 4096).unwrap();
+    }
+}
+
+fn free_regions(regions: &mut RTree, l0_pt: &mut [u64], skip: bool) -> Result<(), vm::Error> {
+    let mut rit = regions.iter();
+    while let Some(region) = rit.next() {
+        free_region(region, l0_pt, skip);
     }
     Ok(())
 }
@@ -736,9 +941,15 @@ fn free_task(pid: usize) -> Result<(), vm::Error> {
         vm::PR_PW,
         false,
     )
-    .map_err(|e| e)?;
+    .unwrap();
 
-    free_regions(&mut task.regions, l0_pt.as_slice_mut()).map_err(|e| e)?;
+    free_regions(&mut task.program, l0_pt.as_slice_mut(), false).unwrap();
+
+    free_region(&task.spel0, l0_pt.as_slice_mut(), false);
+    free_region(&task.brk, l0_pt.as_slice_mut(), false);
+    free_region(&task.mmap, l0_pt.as_slice_mut(), false);
+
+    task.user_sp = None;
 
     for i in 0..task.files.len() {
         if let Some(f) = &mut task.files[i] {
@@ -746,6 +957,10 @@ fn free_task(pid: usize) -> Result<(), vm::Error> {
             if c.is_err() {}
         }
     }
+
+    task.program.clear();
+    task.brk.len = 0;
+    task.mmap.len = 0;
 
     free_pt(task.user_pt.unwrap() as u64);
     Ok(())
@@ -782,13 +997,35 @@ pub fn exit_group() -> u64 {
 }
 
 pub fn getuid() -> u64 {
-    1000
+    0
+}
+
+pub fn getgid() -> u64 {
+    0
+}
+
+#[repr(C)]
+pub struct OldUtsname {
+    pub name: [u8; 45],
+}
+
+pub fn uname() -> u64 {
+    let t = mycpu().get_task().unwrap();
+    let tf = t.get_trap_frame().unwrap();
+    let ptr = unsafe { (tf.regs[0] as *mut OldUtsname).as_mut() }.unwrap();
+
+    (&mut ptr.name[0..7]).copy_from_slice("hoenix\0".as_bytes());
+    (&mut ptr.name[7..7 + 6]).copy_from_slice("local\0".as_bytes());
+    (&mut ptr.name[7 + 6..7 + 6 + 6]).copy_from_slice("0.0.1\0".as_bytes());
+    (&mut ptr.name[7 + 6 + 6..7 + 6 + 6 + 2]).copy_from_slice("0\0".as_bytes());
+    (&mut ptr.name[7 + 6 + 6 + 2..7 + 6 + 6 + 2 + 8]).copy_from_slice("aarch64\0".as_bytes());
+    0
 }
 
 pub fn wait() -> u64 {
     let t = mycpu().get_task().unwrap();
     let tf = t.get_trap_frame().unwrap();
-    let ptr = t as *const Task;
+    let ptr = t as *mut Task;
     let wait_lock = WAIT.acquire();
     let tasks = TASKS.as_mut();
     loop {
@@ -800,11 +1037,12 @@ pub fn wait() -> u64 {
                 if parent == ptr {
                     has_child = true;
                     if let State::Zombie = task.state {
-                        unsafe {
-                            *(tf.regs[0] as *mut u32) = task.exit_code as u32;
+                        if let Some(tid) = task.tid {
+                            unsafe { *(tid as *mut u32) = 0 }
                         }
                         task.state = State::Free;
                         task.parent = None;
+                        task.tid = None;
                         return task.pid as u64;
                     }
                 }
@@ -820,6 +1058,10 @@ pub fn wait() -> u64 {
     }
 }
 
+pub fn wait4() -> u64 {
+    wait()
+}
+
 fn copy_pm(from_pm: usize, to_pm: usize, n: usize) -> Result<(), ()> {
     for i in 0..n {
         let to = PmWrap::new(to_pm + (4096 * i), vm::PR_PW, true).map_err(|_| ())?;
@@ -829,115 +1071,101 @@ fn copy_pm(from_pm: usize, to_pm: usize, n: usize) -> Result<(), ()> {
     Ok(())
 }
 
+static COW: Lock<()> = Lock::new("cow", ());
+
+pub fn find_region(task: &mut Task, v: usize) -> Option<Region> {
+    if task.brk.has(v) {
+        return Some(task.brk);
+    }
+    if task.mmap.has(v) {
+        return Some(task.brk);
+    }
+    if let Some(r) = task.program.iter().find(|r| r.has(v)) {
+        return Some(*r);
+    }
+    None
+}
+
 pub fn dabt_handler() {
     let task = mycpu().get_task().unwrap();
     let vaddr = r_far_el1() as usize;
+    let lock = COW.acquire();
 
-    let mut it = task.regions.iter();
-    while let Some((k, v)) = it.next() {
-        if vaddr >= *k && vaddr < (k + v.len) {
-            if v.flags & elf::PF_W > 0 {
-                let l0_pt = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false);
-                if l0_pt.is_err() {
-                    return;
-                }
-                let l0_pt = l0_pt.unwrap();
-                let kpm = v2p_pt::<fn(*mut u64)>(l0_pt.as_slice_mut(), *k, None);
-                if kpm.is_err() {
-                    return;
-                }
-                let kpm = kpm.unwrap();
-                let mut good = false;
-                let err = v2p_pt(
-                    l0_pt.as_slice_mut(),
-                    vaddr,
-                    Some(|ptr: *mut u64| {
-                        let pm_ = unsafe { *ptr as usize & vm::PHY_MASK };
-                        let page = pm::lookup(pm_);
-                        if page.is_none() {
-                            return;
-                        }
-                        let page = page.unwrap();
-                        let cow = match page.flags {
-                            pm::Flags::Mid => {
-                                let head = page.get_head();
-                                if head.is_none() {
-                                    return;
-                                }
-                                let head = head.unwrap();
-                                if let pm::Flags::Cow = head.flags {
-                                    // TODO
-                                    // assumption: if pm.size>4096 {one region}
-                                    let kpage = pm::lookup(kpm);
-                                    if kpage.is_none() {
-                                        return;
-                                    }
-                                    let kpage = kpage.unwrap();
-                                    assert!(kpage.eql(head));
-                                    Some((head, kpm, *k))
-                                } else {
-                                    None
-                                }
-                            }
-                            pm::Flags::Cow => Some((page, pm_, align_b(vaddr, 4096))),
-                            _ => None,
-                        };
+    if let Some(region) = find_region(task, vaddr) {
+        if region.flags & elf::PF_W > 0 {
+            let block = align_b(vaddr, region.blksize());
 
-                        if let Some((cow, pm, vm)) = cow {
+            let l0_pt = PmWrap::new(
+                task.user_pt.unwrap() as usize, //
+                vm::PR_PW,
+                false,
+            )
+            .unwrap();
+
+            let mut good = false;
+            let _ = v2p_pt(
+                l0_pt.as_slice_mut(),
+                block,
+                Some(|ptr: *mut u64| {
+                    let pm_ = unsafe { *ptr as usize & vm::PHY_MASK };
+                    let cow = pm::lookup(pm_).unwrap();
+                    assert!(cow.ref_cnt > 0);
+                    assert!(cow.len() == region.blksize());
+                    match cow.flags {
+                        pm::Flags::Cow => {
+                            assert!(cow.ref_cnt > 0);
+                            let n = cow.len() / 4096;
+
                             if cow.ref_cnt == 1 {
+                                map_ovwr(
+                                    l0_pt.as_slice_mut(), //
+                                    block,
+                                    pm_,
+                                    n,
+                                    vm::PR_PW_UR_UW1,
+                                )
+                                .unwrap();
                                 cow.flags = pm::Flags::Used;
-                                if let Err(_) = map_ovwr(
-                                    l0_pt.as_slice_mut(),
-                                    vm,
-                                    pm,
-                                    cow.len() / 4096,
-                                    vm::PR_PW_UR_UW1,
-                                ) {
-                                    return;
-                                }
                             } else {
-                                let new_pm = pm::alloc(cow.len());
-                                if new_pm.is_err() {
-                                    return;
-                                }
-
-                                let new_pm = new_pm.unwrap();
-                                let defer = defer(|| {
-                                    pm::free(new_pm);
-                                });
-
-                                let n = cow.len() / 4096;
-                                if copy_pm(pm, new_pm, n).is_err() {
-                                    return;
-                                }
+                                let new_pm = pm::alloc(cow.len()).unwrap();
+                                copy_pm(pm_, new_pm, n).unwrap();
                                 cow.ref_cnt -= 1;
-                                if let Err(_) = map_ovwr(
-                                    l0_pt.as_slice_mut(),
-                                    vm,
+                                map_ovwr(
+                                    l0_pt.as_slice_mut(), //
+                                    block,
+                                    // pm_,
                                     new_pm,
-                                    cow.len() / 4096,
+                                    n,
                                     vm::PR_PW_UR_UW1,
-                                ) {
-                                    return;
-                                }
-                                forget(defer);
-                            };
+                                )
+                                .unwrap();
+                            }
+                            tlbi_vmalle1!();
                             good = true;
                         }
-                    }),
-                );
-                if err.is_ok() && good {
-                    return;
-                }
+                        _ => {
+                            // segmentiation
+                        }
+                    };
+                }),
+            )
+            .unwrap();
+
+            if good {
+                return;
             }
         }
     }
+
+    _ = lock;
     //TODO segfaultonomy
-    print!("======================\n");
-    print!("Dabt.. at {:x} pid {}\n", vaddr, task.pid);
-    print!("{:?}\n", task.get_trap_frame().unwrap());
-    print!("======================\n");
-    loop {}
+    let tf = task.get_trap_frame().unwrap();
+    let tls = r_tpidr_el0();
+    let x = r_tpidrro_el0();
+    panic!(
+        "FATALITY: dabt.. address {:x} pid {} pc {:x} tls {:x} {}\n",
+        vaddr, task.pid, tf.pc, tls, x
+    );
 }
 
 pub fn sleep<T>(chan: u64, lock: &Lock<T>) {
@@ -1019,10 +1247,7 @@ pub fn yild() {
         let lock = task.lock.acquire(); // re-acquire one released at fork ret
         task.state = State::Ready;
         sched();
-        // print!("yield: {}\n", task.pid);
         let _ = lock;
-    } else {
-        // print!("yield: none\n");
     }
 }
 
@@ -1031,14 +1256,52 @@ pub fn getpid() -> u64 {
     task.pid as u64
 }
 
-fn alloc_pid() -> Option<u16> {
+pub fn getppid() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    match task.parent {
+        Some(p) => unsafe { p.as_mut() }.unwrap().pid as u64,
+        _ => task.pid as u64,
+    }
+}
+
+pub fn kill() -> u64 {
+    0
+}
+
+pub fn getcwd() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let cwd = task.cwd.as_ref().unwrap();
+    let len = min(tf.regs[1] as usize, cwd.as_bytes().len());
+    let buf = as_slice_mut(tf.regs[0] as *mut u8, len + 1);
+    buf[0..cwd.as_bytes().len()].copy_from_slice(&cwd.as_bytes());
+    if tf.regs[1] as usize > cwd.len() {
+        buf[cwd.len()] = 0;
+    } else {
+        return 0;
+    }
+    tf.regs[0]
+}
+
+pub fn getpgid() -> u64 {
+    0
+}
+
+pub fn setpgid() -> u64 {
+    0
+}
+
+fn alloc_task() -> Option<&'static mut Task> {
     let tasks = TASKS.as_mut();
     for i in 0..tasks.len() {
         let task = &mut tasks[i];
         let lock = task.lock.acquire();
         if let State::Free = task.state {
             task.state = State::Used;
-            return Some(i as u16);
+            task.pid = i as u16;
+            forget(lock);
+            task.init_1(0);
+            return unsafe { (task as *const Task as *mut Task).as_mut() };
         }
         let _ = lock;
     }
@@ -1051,60 +1314,33 @@ fn restore_ttbr0(task_idx: usize, pt: usize) {
     dsb!();
     isb!();
     tlbi_aside1(task_idx as u64);
+    tlbi_vmalle1!();
     dsb!();
     isb!();
 }
 
-pub fn alloc_task() -> Option<&'static mut Task> {
-    let tasks = TASKS.as_mut();
-    if let Some(pid) = alloc_pid() {
-        let task = &mut tasks[pid as usize];
-        task.pid = pid;
-        task.init_1(0);
-        task.state = State::Used;
-        Some(task)
-    } else {
-        None
-    }
-}
-
 pub fn create_task(entry: u64) {
-    let tasks = TASKS.as_mut();
-    let pid = alloc_pid().unwrap();
-    let task = &mut tasks[pid as usize];
-    task.pid = pid;
-    task.init_1(entry);
+    let task = alloc_task().unwrap();
     task.files[0] = Some(fs::open_cons().unwrap());
     task.files[1] = Some(fs::open_cons().unwrap());
+    task.files[2] = Some(fs::open_cons().unwrap());
     task.state = State::Ready;
+
+    task.lock.release();
 }
 
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-extern "C" fn switch(save: *mut u64, load: *const u64) {
-    naked_asm!(
-        "stp x19, x18, [x0], #16",
-        "stp x21, x20, [x0], #16",
-        "stp x23, x22, [x0], #16",
-        "stp x25, x24, [x0], #16",
-        "stp x27, x26, [x0], #16",
-        "stp x29, x28, [x0], #16",
-        "mov x2, sp",
-        "stp x2, x30, [x0], #16",
-        //==========================
-        "ldp x19, x18, [x1], #16",
-        "ldp x21, x20, [x1], #16",
-        "ldp x23, x22, [x1], #16",
-        "ldp x25, x24, [x1], #16",
-        "ldp x27, x26, [x1], #16",
-        "ldp x29, x28, [x1], #16",
-        "ldp x2, x30, [x1], #16",
-        "mov sp, x2",
-        "ret"
-    )
+pub fn rt_sigaction() -> u64 {
+    0
 }
 
 static FIRST: AtomicBool = AtomicBool::new(true);
+
+const TEST_ENV: [&[u8]; 4] = [
+    "PATH=/bin".as_bytes(),
+    "PWD=/".as_bytes(),
+    "LC_ALL=C".as_bytes(),
+    "PS1=hoenix@lazybox $ ".as_bytes(),
+];
 
 #[unsafe(no_mangle)]
 #[allow(unused)]
@@ -1116,10 +1352,24 @@ pub extern "C" fn forkret() {
 
     restore_ttbr0(task.pid as usize, task.user_pt.unwrap() as usize);
 
-    w_tpidrro_el0(0xff0);
     if FIRST.swap(false, Ordering::Release) {
         print!("launching init..\n");
-        execv("init", &[], &[]).unwrap();
+        execv_inner(
+            "busybox",
+            &[
+                "sh".as_bytes(),
+                // "sh".as_bytes(),
+                // "-a".as_bytes(),
+                // "bar".as_bytes(),
+                // "baz".as_bytes(),
+                // "fiz".as_bytes(),
+                // "fix".as_bytes(),
+                // "fox".as_bytes(),
+            ],
+            &TEST_ENV,
+            false,
+        )
+        .unwrap();
         task.cwd = Some("/".into());
     }
 
@@ -1150,6 +1400,35 @@ pub extern "C" fn forkret() {
             in(reg) task.trapframe
         )
     }
+}
+
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+extern "C" fn switch(save: *mut u64, load: *const u64) {
+    naked_asm!(
+        "stp x19, x18, [x0], #16",
+        "stp x21, x20, [x0], #16",
+        "stp x23, x22, [x0], #16",
+        "stp x25, x24, [x0], #16",
+        "stp x27, x26, [x0], #16",
+        "stp x29, x28, [x0], #16",
+        "mov x2, sp",
+        "stp x2, x30, [x0], #16",
+        "mrs x2, tpidr_el0",
+        "str x2, [x0], #8",
+        //=========================
+        "ldp x19, x18, [x1], #16",
+        "ldp x21, x20, [x1], #16",
+        "ldp x23, x22, [x1], #16",
+        "ldp x25, x24, [x1], #16",
+        "ldp x27, x26, [x1], #16",
+        "ldp x29, x28, [x1], #16",
+        "ldp x2, x30, [x1], #16",
+        "mov sp, x2",
+        "ldr x2, [x1], #8",
+        "msr tpidr_el0, x2",
+        "ret"
+    )
 }
 
 static TASKS: SyncUnsafeCell<[Task; NTASKS]> = SyncUnsafeCell::new([

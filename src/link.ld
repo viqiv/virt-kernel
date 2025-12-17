@@ -63,12 +63,14 @@ SECTIONS {
     {
         . = ALIGN(4096);
         _boot_stack_btm = .;
-        . += (4096*8);
+        . += (4096*4);
         _boot_stack = .;
         *(.bss.*)
         *(.bss)
+        *(.bss.heap)
         _bss_end = .;
     }
+    
     
     .user ALIGN(4K) :
         AT(ADDR(.user) - 0xffff000000000000) 

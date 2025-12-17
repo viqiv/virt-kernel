@@ -410,9 +410,6 @@ impl Allocator {
     fn free(&mut self, addr: usize) {
         let page = self.lookup(addr).unwrap();
         page.assert_ok();
-        if let Flags::Mid = page.flags {
-            return;
-        }
         assert!(page.ref_cnt > 0);
         page.ref_cnt -= 1;
         if page.ref_cnt > 0 {

@@ -25,6 +25,7 @@ impl<T> SyncUnsafeCell<T> {
 
 unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}
 
+#[unsafe(link_section = ".bss.heap")]
 static HEAP_MEMORY: SyncUnsafeCell<[u8; MB]> = SyncUnsafeCell(UnsafeCell::new([0u8; MB]));
 
 pub fn init() {

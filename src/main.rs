@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unused)]
 
 extern crate alloc;
 
@@ -29,22 +30,6 @@ mod uart;
 mod virtio;
 mod vm;
 
-// static BUF: SyncUnsafeCell<[u8; 512]> = SyncUnsafeCell(UnsafeCell::new([0; 512]));
-
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".user")]
-#[allow(unused)]
-extern "C" fn task() {
-    naked_asm!("b .");
-    // let mut i = 0;
-    // loop {
-    // print!("...task {}\n", i);
-    // pstate_i_clr();
-    // i += 1;
-    // }
-}
-
 #[unsafe(no_mangle)]
 fn main(b: usize, e: usize) {
     pm::init(b, e);
@@ -54,67 +39,10 @@ fn main(b: usize, e: usize) {
     trap::init();
     uart::init_rx();
     timer::init();
-    // arch::pstate_i_clr();
-    print!("bEGIN: {:x} End: {:x}\n", b, e);
     virtio::init();
     enable_fp();
-    sched::create_task(task as *const fn() as u64);
+    sched::create_task(0);
     sched::scheduler();
-
-    // let (fid, _) = p9::walk("/fox").unwrap();
-    // print!("FID = {:?}\n", fid);
-    // let (fid, _) = p9::walk("/main.o").unwrap();
-    // print!("FID = {:?}\n", fid);
-    // let qid = virtio::p9::open(fid, p9::O::RDWR as u32).unwrap();
-    // print!("QID = {:?}\n", qid);
-    // let n = p9::write(fid, "12345678910\n".as_bytes(), 0).unwrap();
-    // print!("N = {}\n", n);
-    // let n = p9::write(fid, "qweertyuiop".as_bytes(), 11).unwrap();
-    // print!("N = {}\n", n);
-
-    // p9::remove(fid).unwrap();
-    // p9::clunk(fid).unwrap();
-    // p9::create(fid, "foxx", 0, p9::O::RDWR as u32, 1000).unwrap();
-    // p9::mkdir(fid, "foxxx", p9::O::RDWR as u32, 1000).unwrap();
-    // let n = p9::write(fid, "chapa ilale".as_bytes(), 0).unwrap();
-    // print!("N = {}\n", n);
-
-    // arch::pstate_i_clr();
-    // let buf = unsafe { BUF.0.get().as_mut() }.unwrap();
-    // let n = p9::stat(0, false);
-    // print!("N = {:?}\n", n);
-
-    // print!(
-    //     "kernel stack top 0x{:x} bottom 0x{:x} current sp 0x{:x}\n",
-    //     unsafe { (&_boot_stack) as *const u64 as usize },
-    //     unsafe { (&_boot_stack_btm) as *const u64 as usize },
-    //     r_sp()
-    // );
-
-    // blk::read_sync(0, BUF.get_mut()).unwrap();
-    // blk::read_sync(1, BUF.get_mut()).unwrap();
-    // blk::read_sync(2, BUF.get_mut()).unwrap();
-    // blk::read_sync(3, BUF.get_mut()).unwrap();
-    // blk::read_sync(4, BUF.get_mut()).unwrap();
-    // blk::read_sync(5, BUF.get_mut()).unwrap();
-    // blk::read_sync(6, BUF.get_mut()).unwrap();
-    // blk::read_sync(7, BUF.get_mut()).unwrap();
-    // blk::read_sync(8, BUF.get_mut()).unwrap();
-    // blk::read_sync(10, BUF.get_mut()).unwrap();
-    // blk::read_sync(0, BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-    // rng::read_sync(BUF.get_mut()).unwrap();
-
-    // for i in 0..n as usize {
-    //     print!("{}", buf[i] as char);
-    // }
-
     loop {
         wfi!();
     }

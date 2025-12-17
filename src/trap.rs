@@ -10,6 +10,7 @@ use crate::{
 use core::{
     arch::{asm, naked_asm},
     cell::UnsafeCell,
+    fmt::{LowerHex, Write},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +20,33 @@ pub struct Frame {
     pub sp_el0: u64,
     pub pstate: u64,
     pub regs: [u64; 31],
+}
+
+impl Frame {
+    pub fn zero(&mut self) {
+        self.pc = 0;
+        self.sp_el0 = 0;
+        self.pstate = 0;
+        for i in 0..self.regs.len() {
+            self.regs[i] = 0;
+        }
+    }
+}
+
+impl LowerHex for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TF {\n").unwrap();
+        f.write_fmt(format_args!("pc: {:x},\n", self.pc)).unwrap();
+        f.write_fmt(format_args!("sp_el0: {:x},\n", self.sp_el0))
+            .unwrap();
+        f.write_fmt(format_args!("pstate: {:x},\n", self.pstate))
+            .unwrap();
+        for i in 0..self.regs.len() {
+            f.write_fmt(format_args!("r{}: {:x},\n", i, self.regs[i]))
+                .unwrap();
+        }
+        f.write_str("}")
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -40,7 +68,8 @@ pub extern "C" fn irq_handler(frame: &Frame) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sync_handler(frame: &Frame) {
-    mycpu().get_task().unwrap().trapframe = frame as *const Frame as u64;
+    let task = mycpu().get_task().unwrap();
+    task.trapframe = frame as *const Frame as u64;
     let esr = arch::r_esr_el1();
     if esr >> 26 == 0b010101 {
         return svc::handle();
@@ -51,7 +80,8 @@ pub extern "C" fn sync_handler(frame: &Frame) {
     let far = arch::r_far_el1();
     let elr = arch::r_elr_el1();
     print!(
-        "sync... far = 0x{:x} erl: 0x{:x} ret pc: 0x{:x} esr: {:x}\n",
+        "sync... pid {} far = 0x{:x} erl: 0x{:x} ret pc: 0x{:x} esr: {:x}\n",
+        task.pid,
         far,
         elr,
         frame.pc,

@@ -679,19 +679,14 @@ fn clone_region(region: &Region, from_pt: &mut [u64], to_pt: &mut [u64]) {
         let closure = |ent: *mut u64| unsafe {
             *ent = (*ent & vm::PHY_MASK as u64) | flags | 0x403;
         };
-        let cl = COW.acquire();
         let vm = region.vaddr + (i * region.blksize());
         let pm = v2p_pt(from_pt, vm, Some(closure)).unwrap();
-        let pm_page = pm::lookup(pm).unwrap();
-        assert!(pm_page.len() == region.blksize());
-        assert!(pm_page.ref_cnt > 0);
-        let pages = pm_page.len() / 4096;
+        crate::pm::dup(pm, region.blksize()).unwrap();
+        let pages = region.blksize() / 4096;
         map(to_pt, vm, pm, pages, flags).unwrap();
         for j in 1..pages {
             v2p_pt(from_pt, vm + 4096 * j, Some(closure)).unwrap();
         }
-        pm_page.dup_for_cow();
-        drop(cl);
     }
 }
 
@@ -916,11 +911,8 @@ fn free_region(region: &Region, l0_pt: &mut [u64], skip: bool) {
     for i in 0..n {
         let v = region.vaddr + i * region.blksize();
         let p = v2p_pt::<fn(*mut u64)>(l0_pt, v, None).unwrap();
-        let pm_page = pm::lookup(p).unwrap();
-        assert!(pm_page.ref_cnt > 0);
-        assert_eq!(pm_page.len(), region.blksize());
         if !skip {
-            pm::free(p);
+            pm::free(p, region.blksize());
         }
         unmap(l0_pt, v, region.blksize() / 4096).unwrap();
     }
@@ -1108,15 +1100,11 @@ pub fn dabt_handler() {
                 block,
                 Some(|ptr: *mut u64| {
                     let pm_ = unsafe { *ptr as usize & vm::PHY_MASK };
-                    let cow = pm::lookup(pm_).unwrap();
-                    assert!(cow.ref_cnt > 0);
-                    assert!(cow.len() == region.blksize());
-                    match cow.flags {
-                        pm::Flags::Cow => {
-                            assert!(cow.ref_cnt > 0);
-                            let n = cow.len() / 4096;
 
-                            if cow.ref_cnt == 1 {
+                    pm::cow_action(pm_, region.blksize(), |a, al| {
+                        let n = region.blksize() / 4096;
+                        match a {
+                            pm::CowAction::Remap => {
                                 map_ovwr(
                                     l0_pt.as_slice_mut(), //
                                     block,
@@ -1125,28 +1113,22 @@ pub fn dabt_handler() {
                                     vm::PR_PW_UR_UW1,
                                 )
                                 .unwrap();
-                                cow.flags = pm::Flags::Used;
-                            } else {
-                                let new_pm = pm::alloc(cow.len()).unwrap();
+                            }
+                            pm::CowAction::Alloc => {
+                                let new_pm = al.alloc(region.blksize()).unwrap();
                                 copy_pm(pm_, new_pm, n).unwrap();
-                                cow.ref_cnt -= 1;
                                 map_ovwr(
                                     l0_pt.as_slice_mut(), //
                                     block,
-                                    // pm_,
                                     new_pm,
                                     n,
                                     vm::PR_PW_UR_UW1,
                                 )
                                 .unwrap();
                             }
-                            tlbi_vmalle1!();
-                            good = true;
                         }
-                        _ => {
-                            // segmentiation
-                        }
-                    };
+                        good = true;
+                    });
                 }),
             )
             .unwrap();

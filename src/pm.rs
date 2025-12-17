@@ -16,7 +16,7 @@ pub fn align_f(n: usize, t: usize) -> usize {
     align_b(n.wrapping_sub(1), t).wrapping_add(t)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Flags {
     None,
@@ -294,7 +294,7 @@ impl Allocator {
         let mut i = align_f(k_end, 4 * KB);
         let ram_end = self.offt + GB;
         while i < ram_end {
-            self.free(i);
+            self.free(i, 4 * KB);
             i += 4 * KB;
         }
     }
@@ -303,7 +303,7 @@ impl Allocator {
         let mut i = self.offt;
         let ram_end = align_b(k_begin, 4 * KB);
         while i < ram_end {
-            self.free(i);
+            self.free(i, 4 * KB);
             i += 4 * KB;
         }
     }
@@ -374,7 +374,7 @@ impl Allocator {
         }
     }
 
-    fn alloc(&mut self, n: usize) -> Option<usize> {
+    pub fn alloc(&mut self, n: usize) -> Option<usize> {
         match self._alloc(n) {
             Some(n) => {
                 let page = self.lookup(n as usize + self.offt).unwrap();
@@ -407,10 +407,26 @@ impl Allocator {
         unsafe { self.page_ptr.add(idx).as_mut() }
     }
 
-    fn free(&mut self, addr: usize) {
+    pub fn dup(&self, addr: usize, len: usize) -> Result<(), ()> {
+        if let Some(p) = self.lookup(addr) {
+            if p.ref_cnt == 0 {
+                return Err(());
+            }
+            if p.len() != len {
+                return Err(());
+            }
+            p.dup_for_cow();
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn free(&mut self, addr: usize, len: usize) {
         let page = self.lookup(addr).unwrap();
         page.assert_ok();
         assert!(page.ref_cnt > 0);
+        assert!(page.len() == len);
         page.ref_cnt -= 1;
         if page.ref_cnt > 0 {
             return;
@@ -418,6 +434,30 @@ impl Allocator {
         page.unmark_mids();
         page.flags = Flags::None;
         page.join(self);
+    }
+}
+
+pub enum CowAction {
+    Remap,
+    Alloc,
+}
+
+pub fn cow_action<F: FnMut(CowAction, &mut Allocator)>(addr: usize, len: usize, mut f: F) {
+    let lock = ALLOC.acquire();
+    if let Some(page) = lock.as_ref().lookup(addr) {
+        if page.flags != Flags::Cow {
+            return;
+        }
+        if page.len() != len {
+            return;
+        }
+        if page.ref_cnt == 1 {
+            page.flags = Flags::Used;
+            f(CowAction::Remap, lock.as_mut());
+        } else {
+            page.ref_cnt -= 1;
+            f(CowAction::Alloc, lock.as_mut());
+        }
     }
 }
 
@@ -430,15 +470,20 @@ pub fn alloc(n: usize) -> Result<usize, ()> {
     }
 }
 
-pub fn free(addr: usize) {
+pub fn free(addr: usize, len: usize) {
     let lock = ALLOC.acquire();
-    lock.as_mut().free(addr);
+    lock.as_mut().free(addr, len);
 }
 
-pub fn lookup(addr: usize) -> Option<&'static mut Page> {
+pub fn dup(addr: usize, len: usize) -> Result<(), ()> {
     let lock = ALLOC.acquire();
-    lock.as_mut().lookup(addr)
+    lock.as_mut().dup(addr, len)
 }
+
+// pub fn lookup(addr: usize) -> Option<&'static mut Page> {
+//     let lock = ALLOC.acquire();
+//     lock.as_mut().lookup(addr)
+// }
 
 pub fn init(k_begin: usize, k_end: usize) {
     let lock = ALLOC.acquire();

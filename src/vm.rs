@@ -423,7 +423,7 @@ fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
             if paddr >= 0x40000000 {
                 let pt = PmWrap::new(paddr as usize, PR, false).map_err(|_| ())?;
                 free_walk(pt.as_slice_mut(), level + 1)?;
-                pm::free(paddr as usize);
+                pm::free(paddr as usize, 4096);
             }
         }
     } else {
@@ -433,7 +433,7 @@ fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
             //HARDcoDE
             if paddr >= 0x40000000 && (pt[i] & 3) > 0 {
                 // print!("paddr: {:x}\n", paddr);
-                pm::free(paddr as usize);
+                pm::free(paddr as usize, 4096);
             }
         }
     }
@@ -443,7 +443,7 @@ fn free_walk(pt: &[u64], level: u8) -> Result<(), ()> {
 pub fn free_pt(pm_pt: u64) {
     let pt = PmWrap::new(pm_pt as usize, PR, false).unwrap();
     free_walk(pt.as_slice(), 0).unwrap();
-    pm::free(pm_pt as usize);
+    pm::free(pm_pt as usize, 4096);
 }
 
 pub fn init(k_begin: usize, k_end: usize) {

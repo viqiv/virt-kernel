@@ -15,3 +15,7 @@ opt-level = "z"
 [dependencies]
 linked_list_allocator = "0.10.5"
 hashbrown = "0.16.1"
+
+[features]
+dbg = []
+

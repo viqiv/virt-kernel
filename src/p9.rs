@@ -10,12 +10,12 @@ use alloc::{collections::btree_set::SymmetricDifference, str, string::String, ve
 use hashbrown::HashMap;
 
 use crate::{
-    dsb,
+    dsb, fs,
     heap::SyncUnsafeCell,
-    print,
+    memcpy, print, ptr2mut,
     sched::wakeup,
     spin::Lock,
-    stuff::BitSet128,
+    stuff::{BitSet128, print_slice_chars},
     trap::gic_enable_intr,
     virtio::{self, Q, Regs, Status, get_irq_status, init_dev_common, irq_ack},
 };
@@ -212,6 +212,7 @@ impl P9 {
         match self.fid_bs.first_clr() {
             Some(i) => {
                 self.fid_bs.set(i);
+                print!("ALLOC fid: {}\n", i);
                 Some(i as u32)
             }
             _ => None,
@@ -309,6 +310,7 @@ enum Op {
 
 #[repr(u32)]
 #[allow(non_camel_case_types)]
+#[derive(Clone, Copy)]
 pub enum O {
     RDONLY = 00000000,
     WRONLY = 00000001,
@@ -329,6 +331,38 @@ pub enum O {
     NOATIME = 01000000,
     CLOEXEC = 02000000,
     SYNC = 04000000,
+}
+
+fn o2p9o(o: u32) -> u32 {
+    let mut acc = 0;
+    for i in 0..23 {
+        let cur = o & (1u32 << i);
+        let o2 = match cur {
+            fs::O::RDONLY => O::RDONLY,
+            fs::O::WRONLY => O::WRONLY,
+            fs::O::RDWR => O::RDWR,
+            fs::O::CREAT => O::CREATE,
+            fs::O::EXCL => O::EXCL,
+            fs::O::NOCTTY => O::NOCTTY,
+            fs::O::TRUNC => O::TRUNC,
+            fs::O::APPEND => O::APPEND,
+            fs::O::NONBLOCK => O::NONBLOCK,
+            fs::O::DSYNC => O::DSYNC,
+            fs::O::ASYNC => O::FASYNC,
+            fs::O::DIRECTORY => O::DIRECTORY,
+            fs::O::NOFOLLOW => O::NOFOLLOW,
+            fs::O::DIRECT => O::DIRECT,
+            fs::O::LARGEFILE => O::LARGEFILE,
+            fs::O::NOATIME => O::NOATIME,
+            fs::O::CLOEXEC => O::CLOEXEC,
+            fs::O::SYNC => O::SYNC,
+            // x @ (fs::O::PATH | fs::O::TMPFILE) => panic!("unhandled 0 to p9 0: {}", x),
+            // x => panic!("unhandled 0 to p9 0: {}", x),
+            _ => O::RDONLY,
+        };
+        acc |= o2 as u32;
+    }
+    acc
 }
 
 impl BitOr for O {
@@ -377,7 +411,7 @@ impl Stat {
 }
 
 mod ops {
-    use core::{cmp::max, hint::spin_loop, sync::atomic::spin_loop_hint};
+    use core::{cmp::max, hint::spin_loop, mem::forget};
 
     use alloc::vec::Vec;
 
@@ -385,6 +419,8 @@ mod ops {
         p9::{Msg, Op, P9, P9L, QID, Stat, VERSION},
         print,
         sched::sleep,
+        spin::LockGuard,
+        stuff::defer,
         virtio::{self, get_irq_status, irq_ack},
     };
 
@@ -489,23 +525,9 @@ mod ops {
         path.split('/').filter(|s| !s.is_empty()).collect()
     }
 
-    pub fn walk(path: &str) -> Result<(u32, QID), ()> {
-        if path.is_empty() {
-            return Err(());
-        }
-
-        let lock = P9L.acquire();
+    pub fn walk_inner(lock: &LockGuard<P9>, wnames: &[&str]) -> Result<(u32, QID), ()> {
         let p9 = lock.as_mut();
-
-        if path == "/" {
-            return Ok((0, p9.qid));
-        }
-
-        let wnames = path_to_wnames(path);
-        if wnames.len() > u16::MAX as usize {
-            return Err(());
-        }
-        // print!("wnames {:?}\n", wnames);
+        print!("wnames {:?}\n", wnames);
 
         // size[4] Twalk tag[2] fid[4] newfid[4] nwname[2] nwname*(wname[s])
         // size[4] Rwalk tag[2] nwqid[2] nwqid*(wqid[13])
@@ -516,6 +538,7 @@ mod ops {
         msg.write_u16(p9.next_tag());
         msg.write_u32(0);
         let fid = p9.alloc_fid().unwrap();
+        let def = defer(|| lock.as_mut().free_fid(fid));
         msg.write_u32(fid);
         msg.write_u16(wnames.len() as u16);
         for i in 0..wnames.len() {
@@ -548,19 +571,12 @@ mod ops {
         virtio::set_ready(regs, 0);
         virtio::notify_q(regs, 0);
 
-        // {
-        //     p9.q.wait_use(old);
-        //     p9.q.pop_used();
-        //     let irq_s = get_irq_status(regs);
-        //     irq_ack(regs, irq_s);
-        // }
-
-        // print!("Data: {:x} {}\n", msg.get_self_ptr(), d1);
         sleep(msg.get_self_ptr(), lock.get_lock());
 
         msg.seek(4);
         let resp_kind = msg.read_u8().unwrap();
         if resp_kind != Op::RWALK as u8 {
+            print!("RWALK ERROR\n");
             return Err(());
         }
         msg.seek(7);
@@ -569,17 +585,38 @@ mod ops {
             return Err(());
         }
 
-        for _ in 0..qid_len - 1 {
-            msg.skip(13);
-        }
-
         let mut qid = super::QID::new();
 
-        qid.kind = msg.read_u8().unwrap().try_into().unwrap();
-        qid.version = msg.read_u32().unwrap();
-        qid.path = msg.read_u64().unwrap();
+        if qid_len > 0 {
+            for _ in 0..qid_len - 1 {
+                msg.skip(13);
+            }
+        }
 
+        if qid_len > 1 {
+            qid.kind = msg.read_u8().unwrap().try_into().unwrap();
+            qid.version = msg.read_u32().unwrap();
+            qid.path = msg.read_u64().unwrap();
+        }
+
+        forget(def);
         Ok((fid, qid))
+    }
+
+    pub fn walk(path: &str) -> Result<(u32, QID), ()> {
+        if path.is_empty() {
+            return Err(());
+        }
+
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+
+        let wnames = path_to_wnames(path);
+        if wnames.len() > u16::MAX as usize {
+            return Err(());
+        }
+
+        walk_inner(&lock, &wnames)
     }
 
     pub fn open(fid: u32, mode: u32) -> Result<(QID, u32), ()> {
@@ -686,6 +723,8 @@ mod ops {
 
         sleep(msg.get_self_ptr(), lock.get_lock());
 
+        p9.free_fid(fid);
+
         msg.seek(4);
         let resp_kind = msg.read_u8().unwrap();
         msg.seek(resp_len + 4);
@@ -761,7 +800,6 @@ mod ops {
         msg.write_u64(offt as u64);
         msg.write_u32(buf.len() as u32);
         if !r {
-            print!("resp len = {}\n", resp_len);
             msg.write_slice(buf.buf());
         }
         let len = msg.tell();
@@ -801,7 +839,6 @@ mod ops {
 
         msg.seek(7);
         let n = msg.read_u32().unwrap() as usize;
-        // print!("N = {}\n", n);
         if r {
             buf.buf_mut()[0..n].copy_from_slice(&msg.get_buf()[msg.pos..][0..n]);
         }
@@ -816,10 +853,7 @@ mod ops {
         rw(fid, RWBuf::W(buf), offt)
     }
 
-    pub fn clunk(fid: u32) -> Result<(), ()> {
-        // size[4] Tclunk tag[2] fid[4]
-        // size[4] Rclunk tag[2]
-        let lock = P9L.acquire();
+    pub fn clunk_inner(lock: &LockGuard<P9>, fid: u32) -> Result<(), ()> {
         let p9 = lock.as_mut();
 
         if !p9.fid_is_ok(fid) {
@@ -857,24 +891,59 @@ mod ops {
 
         sleep(msg.get_self_ptr(), lock.get_lock());
 
+        p9.free_fid(fid);
+
+        print!("CLOSED: fid {} {:?}\n", fid, p9.fid_bs.first_clr());
+
         msg.seek(4);
         let resp_kind = msg.read_u8().unwrap();
         if resp_kind != Op::RCLUNK as u8 {
             return Err(());
         }
 
-        p9.free_fid(fid);
-
         Ok(())
     }
 
-    pub fn create(fid: u32, name: &str, perm: u32, mode: u32, gid: u32) -> Result<(QID, u32), ()> {
+    pub fn clunk(fid: u32) -> Result<(), ()> {
+        // size[4] Tclunk tag[2] fid[4]
+        // size[4] Rclunk tag[2]
+        let lock = P9L.acquire();
+        clunk_inner(&lock, fid)
+    }
+
+    pub fn create(path: &str, perm: u32, mode: u32, gid: u32) -> Result<(u32, QID, u32), ()> {
         let lock = P9L.acquire();
         let p9 = lock.as_mut();
 
-        if !p9.fid_is_ok(fid) {
+        let perm = 0644;
+        let gid = 0;
+
+        let wnames = path_to_wnames(path);
+
+        if wnames.len() < 1 {
             return Err(());
         }
+
+        let dir_wnames = if wnames.len() > 1 {
+            &wnames[0..wnames.len() - 1]
+        } else {
+            &["."][0..]
+        };
+
+        print!("CREATE WNAMES: {:?}\n", wnames);
+        print!("CREATE DIRNAMES: {:?}\n", dir_wnames);
+
+        let (dir_fid, _) = walk_inner(&lock, dir_wnames).map_err(|_| ())?;
+
+        let def = defer(|| {
+            clunk_inner(&lock, dir_fid);
+        });
+
+        let name = wnames[wnames.len() - 1];
+        print!(
+            "CREATE NAME: {:?} fid {:?} mode {} perm {}\n",
+            name, dir_fid, mode, perm
+        );
 
         // size[4] Tcreate tag[2] fid[4] name[s] perm[4] mode[4] gid [4]
         // size[4] Rcreate tag[2] qid[13] iounit[4]
@@ -884,7 +953,7 @@ mod ops {
         msg.write_u32(tlen as u32);
         msg.write_u8(Op::TCREATE as u8);
         msg.write_u16(p9.next_tag());
-        msg.write_u32(fid);
+        msg.write_u32(dir_fid);
         msg.write_str(name);
         msg.write_u32(perm);
         msg.write_u32(mode as u32);
@@ -928,7 +997,8 @@ mod ops {
         qid.version = msg.read_u32().unwrap();
         qid.path = msg.read_u64().unwrap();
 
-        Ok((qid, msg.read_u32().unwrap()))
+        forget(def);
+        Ok((dir_fid, qid, msg.read_u32().unwrap()))
     }
 
     pub fn mkdir(fid: u32, name: &str, mode: u32, gid: u32) -> Result<QID, ()> {
@@ -1179,10 +1249,10 @@ pub fn init(regs: &mut Regs, irq: u32) {
     ops::set_version(p9);
     ops::attach(p9);
 
-    let root = &mut FILES.as_mut()[0];
-    root.fid = 0;
-    root.qid = p9.qid;
-    root.iou = u16::MAX as u32;
+    // let root = &mut FILES.as_mut()[0];
+    // root.fid = 0;
+    // root.qid = p9.qid;
+    // root.iou = u16::MAX as u32;
 
     gic_enable_intr(irq as usize);
 }
@@ -1215,46 +1285,155 @@ impl File {
     }
 
     pub fn close(&self) -> Result<(), ()> {
-        ops::clunk(self.fid)
+        print!("CLOSE CLUNK {}\n", self.fid);
+        ops::clunk(self.fid).unwrap();
+        Ok(())
+    }
+
+    pub fn stat(&self, stat: &mut fs::Stat) -> Result<(), ()> {
+        if let Ok(s) = stat_inner(self.fid, stat) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn getdents64(&self, buf: &mut [u8], offt: u64) -> Result<(usize, usize), ()> {
+        // dent: Qqbs = 13 + 8 + 1 + 2 = 24
+        let mut p9buf = Vec::with_capacity(buf.len());
+        p9buf.resize(buf.len(), 0);
+        let mut rbuf = p9buf.as_mut_slice();
+        let mut wbuf = buf;
+        let mut dent_off = 0u64;
+        let mut ino = 0u64;
+        let mut name_len = 0u16;
+        if let Ok(n) = ops::readdir(self.fid, rbuf, offt) {
+            rbuf = &mut rbuf[0..n as usize];
+            let mut reclens = 0usize;
+            while rbuf.len() > 0 {
+                rbuf = &mut rbuf[5..]; // ty, version
+                memcpy!((&mut ino) as *mut u64, rbuf.as_ptr(), 8);
+                rbuf = &mut rbuf[8..]; // ino
+                memcpy!((&mut dent_off) as *mut u64, rbuf.as_ptr(), 8);
+                rbuf = &mut rbuf[8..]; // offt
+                let dt = rbuf[0];
+                rbuf = &mut rbuf[1..]; // dt
+                memcpy!((&mut name_len) as *mut u16, rbuf.as_ptr(), 2);
+                rbuf = &mut rbuf[2..]; // name_len
+
+                let reclen = 8 + 8 + 3 + name_len + 1;
+                memcpy!(wbuf.as_mut_ptr(), (&ino) as *const u64, 8);
+                wbuf = &mut wbuf[8..]; //d_ino
+                memcpy!(wbuf.as_mut_ptr(), (&offt) as *const u64, 8);
+                wbuf = &mut wbuf[8..]; //d_off
+                memcpy!(wbuf.as_mut_ptr(), (&reclen) as *const u16, 2);
+                wbuf = &mut wbuf[2..]; //d_reclen
+                wbuf[0] = dt;
+                wbuf = &mut wbuf[1..]; //d_type
+                memcpy!(wbuf.as_mut_ptr(), rbuf[0..].as_ptr(), name_len as usize);
+                wbuf = &mut wbuf[name_len as usize..]; //d_name
+                wbuf[0] = 0;
+                wbuf = &mut wbuf[1..]; //null
+
+                rbuf = &mut rbuf[name_len as usize..]; // name
+
+                reclens += reclen as usize;
+            }
+            Ok((reclens, dent_off as usize))
+        } else {
+            Err(())
+        }
     }
 }
 
-pub fn open(path: &str, mode: u32) -> Result<&'static mut File, ()> {
+pub fn exists(path: &str) -> bool {
     if let Ok((fid, _)) = ops::walk(path) {
-        if let Ok((qid, iou)) = ops::open(fid, mode) {
-            let file = &mut FILES.as_mut()[fid as usize];
-            file.fid = fid;
-            file.iou = iou;
-            file.qid = qid;
-            return Ok(file);
+        ops::clunk(fid).unwrap();
+        true
+    } else {
+        false
+    }
+}
+
+pub fn open(path: &str, flags: u32) -> Result<&'static mut File, ()> {
+    let mode = o2p9o(flags) as u32;
+    let fid = if let Ok((fid, _)) = ops::walk(path) {
+        fid
+    } else {
+        if flags & fs::O::CREAT != 0 {
+            if let Ok((fid, qid, iou)) = ops::create(path, 0, mode, 1000) {
+                let file = &mut FILES.as_mut()[fid as usize];
+                file.fid = fid;
+                file.iou = iou;
+                file.qid = qid;
+                return Ok(file);
+            } else {
+                print!("FAILED TO TCREATE: {}\n", path);
+                return Err(());
+            }
         } else {
+            print!("FAILED TO WALK: {}\n", path);
             return Err(());
         }
+    };
+
+    if let Ok((qid, iou)) = ops::open(fid, mode) {
+        let file = &mut FILES.as_mut()[fid as usize];
+        file.fid = fid;
+        file.iou = iou;
+        file.qid = qid;
+        Ok(file)
+    } else {
+        print!("FAILED TO TOPEN: {} fid {}\n", path, fid);
+        Err(())
+    }
+}
+
+pub fn stat_inner(fid: u32, stat: &mut fs::Stat) -> Result<(), ()> {
+    if let Ok(mut s) = ops::stat(fid) {
+        s.mode |= match s.qid.kind {
+            QIDKind::DIR => 0x4000,
+            QIDKind::APPEND => todo!(),
+            QIDKind::EXCL => todo!(),
+            QIDKind::MOUNT => todo!(),
+            QIDKind::AUTH => todo!(),
+            QIDKind::TMP => todo!(),
+            QIDKind::SYMLINK => 0xA000,
+            QIDKind::LINK | QIDKind::FILE => 0x8000,
+        };
+        stat.st_dev = s.dev as u64;
+        stat.st_size = s.len as i64;
+        stat.st_atime = s.atime as i64;
+        stat.st_mtime = s.mtime as i64;
+        stat.st_mode = s.mode;
+        stat.st_uid = 0;
+        stat.st_gid = 0;
+        stat.st_nlink = if let QIDKind::DIR = s.qid.kind { 2 } else { 1 };
+        stat.st_blocks = 8;
+        stat.st_blksize = 4096;
+        stat.st_ctime = 0;
+        return Ok(());
+    } else {
+        return Err(());
+    }
+}
+
+pub fn stat(path: &str, s: &mut fs::Stat, _: bool) -> Result<(), ()> {
+    if let Ok((fid, _)) = ops::walk(path) {
+        let res = stat_inner(fid, s);
+        ops::clunk(fid).unwrap();
+        return res;
     };
 
     Err(())
 }
 
-pub fn stat(path: &str, _: bool) -> Result<Stat, ()> {
-    if let Ok((fid, qid)) = ops::walk(path) {
-        if let Ok(mut s) = ops::stat(fid) {
-            s.mode |= match s.qid.kind {
-                QIDKind::DIR => 0x4000,
-                QIDKind::APPEND => todo!(),
-                QIDKind::EXCL => todo!(),
-                QIDKind::MOUNT => todo!(),
-                QIDKind::AUTH => todo!(),
-                QIDKind::TMP => todo!(),
-                QIDKind::SYMLINK => 0xA000,
-                QIDKind::LINK | QIDKind::FILE => 0x8000,
-            };
-            return Ok(s);
-        } else {
-            return Err(());
-        }
-    };
-
-    Err(())
+pub fn remove(path: &str) -> Result<(), ()> {
+    if let Ok((fid, _)) = ops::walk(path) {
+        ops::remove(fid)
+    } else {
+        Err(())
+    }
 }
 
 static FILES: SyncUnsafeCell<[File; 128]> = SyncUnsafeCell::new([

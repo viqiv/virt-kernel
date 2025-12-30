@@ -5,6 +5,7 @@ use crate::{
     heap::SyncUnsafeCell,
     sched::{sleep, wakeup},
     spin::Lock,
+    tty,
     uart::{self, putc},
 };
 
@@ -45,9 +46,10 @@ pub fn push_char(c: u8) {
         }
         _ => {
             let c = if c == 13 { 10 } else { c };
-            putc(c);
+            if tty::echo() {
+                putc(c);
+            }
             buf.push_back(c);
-
             if c == 10 {
                 wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
             }

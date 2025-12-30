@@ -3,7 +3,7 @@ use core::{cmp, mem::MaybeUninit};
 use alloc::boxed::Box;
 
 use crate::{
-    fs::{File, open},
+    fs::{self, File, open},
     p9,
     stuff::as_slice_mut,
 };
@@ -147,7 +147,7 @@ pub struct Elf {
 
 impl Elf {
     pub fn new(path: &str) -> Result<Elf, ()> {
-        if let Ok(file) = open(path, p9::O::RDONLY as u32) {
+        if let Ok(file) = open(path, fs::O::RDONLY as u32, 0) {
             let mut elf = Elf {
                 header: Elf64Hdr::zeroed(),
                 file,

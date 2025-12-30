@@ -4,8 +4,10 @@ use core::{
     ptr::{slice_from_raw_parts, slice_from_raw_parts_mut},
 };
 
+use crate::print;
+
 pub struct BitSet128 {
-    back: u128,
+    pub back: u128,
     len: u8,
 }
 
@@ -130,4 +132,32 @@ impl<F: FnOnce()> Drop for Defer<F> {
 
 pub fn defer<F: FnOnce()>(f: F) -> Defer<F> {
     Defer { f: Some(f) }
+}
+
+#[macro_export]
+macro_rules! ptr2mut {
+    ($a:expr, $b:ty) => {
+        unsafe { ($a as *mut $b).as_mut() }.unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! ptr2ref {
+    ($a:expr, $b:ty) => {
+        unsafe { ($a as *mut $b).as_ref() }.unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! memcpy {
+    ($dest:expr, $src:expr, $len:expr) => {
+        $crate::stuff::as_slice_mut($dest as *mut u8, $len)
+            .copy_from_slice($crate::stuff::as_slice($src as *const u8, $len));
+    };
+}
+
+pub fn print_slice_chars(s: &[u8]) {
+    for i in 0..s.len() {
+        print!("{}", s[i] as char);
+    }
 }

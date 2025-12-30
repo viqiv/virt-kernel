@@ -18,7 +18,7 @@ use crate::{
     heap::SyncUnsafeCell,
     isb, p9,
     pm::{self, GB, MB, align_b, align_f},
-    print,
+    print, ptr2mut,
     spin::Lock,
     stuff::{as_slice, as_slice_mut, cstr_as_slice, cstr64_as_slice, defer},
     tlbi_vmalle1, trap,
@@ -217,6 +217,19 @@ impl Task {
         unsafe { (self.trapframe as *mut trap::Frame).as_mut() }
     }
 
+    pub fn get_file(&self, idx: usize) -> Option<&'static mut File> {
+        if idx > self.files.len() {
+            return None;
+        }
+
+        if self.files[idx].is_none() {
+            return None;
+        }
+
+        let file = self.files[idx].as_ref().unwrap();
+        return Some(ptr2mut!((*file) as *const File, File));
+    }
+
     fn init_1(&mut self, pc: u64) {
         let user_pt = pm::alloc(4096).unwrap() as u64;
         self.user_pt = Some(user_pt);
@@ -314,8 +327,9 @@ const SPEL0_SIZE: usize = 4096 * 2;
 
 // inplace
 pub fn execv_inner(path: &str, argv: &[&[u8]], envp: &[&[u8]], skipr: bool) -> Result<(), ()> {
-    let task = mycpu().get_task().unwrap();
+    let mut elf = Elf::new(path).map_err(|_| ())?;
 
+    let task = mycpu().get_task().unwrap();
     let user_pt = task.user_pt.unwrap();
 
     let l0_pt = PmWrap::new(user_pt as usize, vm::PR_PW, false).unwrap();
@@ -325,8 +339,6 @@ pub fn execv_inner(path: &str, argv: &[&[u8]], envp: &[&[u8]], skipr: bool) -> R
     task.brk.len = 0;
     free_regions(&mut task.program, l0_pt.as_slice_mut(), false).unwrap();
     task.program.clear();
-
-    let mut elf = Elf::new(path).map_err(|_| ())?;
 
     let file = unsafe { (elf.file as *mut File).as_mut() }.unwrap();
     let mut phit = PhIter::new(&mut elf);
@@ -359,7 +371,6 @@ pub fn execv_inner(path: &str, argv: &[&[u8]], envp: &[&[u8]], skipr: bool) -> R
         file.seek_to(p.offset as usize);
         file.read_all(&mut slice[0..p.filesz as usize]).unwrap();
         (&mut slice[p.filesz as usize..]).fill(0);
-
         task.program.push_back(Region {
             vaddr: vfrom,
             len,
@@ -810,6 +821,8 @@ pub fn fork() -> u64 {
     if let Some(new_task) = alloc_task() {
         assert!(new_task.lock.holding());
 
+        new_task.cwd = Some(task.cwd.as_ref().unwrap().clone());
+
         let from = PmWrap::new(task.user_pt.unwrap() as usize, vm::PR_PW, false).unwrap();
         let to = PmWrap::new(new_task.user_pt.unwrap() as usize, vm::PR_PW, false).unwrap();
 
@@ -928,6 +941,7 @@ fn free_regions(regions: &mut RTree, l0_pt: &mut [u64], skip: bool) -> Result<()
 
 fn free_task(pid: usize) -> Result<(), vm::Error> {
     let task: &mut Task = &mut TASKS.as_mut()[pid];
+    print!("EXIT pid: {}\n", task.pid);
     let l0_pt = PmWrap::new(
         task.user_pt.unwrap() as usize, //
         vm::PR_PW,
@@ -994,6 +1008,11 @@ pub fn getuid() -> u64 {
 
 pub fn getgid() -> u64 {
     0
+}
+
+pub fn gettid() -> u64 {
+    //TODO
+    getpid()
 }
 
 #[repr(C)]
@@ -1250,6 +1269,10 @@ pub fn kill() -> u64 {
     0
 }
 
+pub fn tgkill() -> u64 {
+    0
+}
+
 pub fn getcwd() -> u64 {
     let task = mycpu().get_task().unwrap();
     let tf = task.get_trap_frame().unwrap();
@@ -1315,13 +1338,17 @@ pub fn rt_sigaction() -> u64 {
     0
 }
 
+pub fn rt_sigprocmask() -> u64 {
+    0
+}
+
 static FIRST: AtomicBool = AtomicBool::new(true);
 
 const TEST_ENV: [&[u8]; 4] = [
     "PATH=/bin".as_bytes(),
     "PWD=/".as_bytes(),
     "LC_ALL=C".as_bytes(),
-    "PS1=hoenix@lazybox $ ".as_bytes(),
+    "PS1=hoenix $ ".as_bytes(),
 ];
 
 #[unsafe(no_mangle)]

@@ -1,31 +1,40 @@
 use crate::{
-    fs, print,
+    fs, print, rtc,
     sched::{self, mycpu},
 };
 
 pub fn handle() {
     let task = mycpu().get_task().unwrap();
     let tf = task.get_trap_frame().unwrap();
-    print!("++ svc {}\n", tf.regs[8]);
+    print!("++ pid: {} svc: {}\n", task.pid, tf.regs[8]);
     tf.regs[0] = match tf.regs[8] {
         17 => sched::getcwd(),
         24 => fs::dup3(),
         25 => fs::fcntl(),
         29 => fs::ioctl(),
+        35 => fs::unlinkat(),
+        48 => fs::faccessat(),
         56 => fs::openat(),
         57 => fs::close(),
+        61 => fs::getdents64(),
         62 => fs::lseek(),
         63 => fs::sys_read(),
         64 => fs::sys_write(),
+        66 => fs::sys_writev(),
+        71 => fs::sendfile64(),
         73 => fs::ppoll(),
         78 => fs::readlinkat(),
         79 => fs::newfsstatat(),
-        80 => fs::fstat(),
+        80 => fs::newfstat(),
+        88 => fs::utimensat(),
         94 => sched::exit_group(),
         96 => sched::settid(),
         99 => sched::set_robust_list(),
+        113 => rtc::clock_gettime(),
         129 => sched::kill(),
+        131 => sched::tgkill(),
         134 => sched::rt_sigaction(),
+        135 => sched::rt_sigprocmask(),
         154 => sched::setpgid(),
         155 => sched::getgid(),
         160 => sched::uname(),
@@ -33,6 +42,7 @@ pub fn handle() {
         172 => sched::getpid(),
         173 => sched::getppid(),
         176 => sched::getgid(),
+        178 => sched::gettid(),
         214 => sched::brk(),
         215 => sched::munmap(),
         220 => sched::fork(),

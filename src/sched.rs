@@ -1006,7 +1006,15 @@ pub fn getuid() -> u64 {
     0
 }
 
+pub fn setuid() -> u64 {
+    0
+}
+
 pub fn getgid() -> u64 {
+    0
+}
+
+pub fn setgid() -> u64 {
     0
 }
 

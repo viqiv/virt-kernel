@@ -134,7 +134,8 @@ pub fn get_termios(ptr: *mut Termios) -> u64 {
     to.l = from.l;
 
     to.line = from.line;
-    to.cc = from.cc;
+    // TODO stack smash
+    // to.cc = from.cc;
     0
 }
 
@@ -142,15 +143,13 @@ pub fn set_termios(ptr: *const Termios) -> u64 {
     let to = TERMIOS.as_mut();
     let from = unsafe { ptr.as_ref().unwrap() };
 
-    print!("new termios set by busybox = {:?}\n", from);
-
     to.i = from.i;
     to.o = from.o;
     to.c = from.c;
     to.l = from.l;
-
     to.line = from.line;
     to.cc = from.cc;
+
     0
 }
 
@@ -161,4 +160,24 @@ pub fn get_winsz(ptr: *mut Winsize) -> u64 {
     w.xpixel = 0;
     w.ypixel = 0;
     0
+}
+
+pub fn echo() -> bool {
+    let t = TERMIOS.as_ref();
+    t.l & TC_LFLAGS::ECHO != 0
+}
+
+pub fn icanon() -> bool {
+    let t = TERMIOS.as_ref();
+    t.l & TC_LFLAGS::ICANON != 0
+}
+
+pub fn opost() -> bool {
+    let t = TERMIOS.as_ref();
+    t.o & TC_OFLAGS::OPOST != 0
+}
+
+pub fn onlcr() -> bool {
+    let t = TERMIOS.as_ref();
+    t.o & TC_OFLAGS::ONLCR != 0
 }

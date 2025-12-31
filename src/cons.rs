@@ -2,7 +2,9 @@ use alloc::collections::vec_deque::VecDeque;
 
 use crate::{
     elf::PT_LOOS,
+    fs,
     heap::SyncUnsafeCell,
+    print,
     sched::{sleep, wakeup},
     spin::Lock,
     tty,
@@ -17,8 +19,21 @@ impl File {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, ()> {
-        uart::Writer::write_bytes(buf);
+        for &c in buf {
+            if tty::opost() && tty::onlcr() && c == b'\n' {
+                putc(b'\r');
+            }
+            putc(c);
+        }
         Ok(buf.len())
+    }
+
+    pub fn stat(&self, stat: &mut fs::Stat) -> Result<(), ()> {
+        stat.st_ino = 0;
+        stat.st_size = 0;
+        stat.st_nlink = 1;
+        stat.st_mode = 0o020000;
+        Ok(())
     }
 }
 
@@ -39,10 +54,22 @@ fn put_backspace() {
 pub fn push_char(c: u8) {
     let lock = BUF.acquire();
     let buf = lock.as_mut();
+
+    if !tty::icanon() {
+        buf.push_back(c);
+        wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
+        return;
+    }
+
     match c {
         127 => {
+            if buf.is_empty() {
+                return;
+            }
+            if tty::echo() {
+                put_backspace();
+            }
             buf.pop_back();
-            put_backspace();
         }
         _ => {
             let c = if c == 13 { 10 } else { c };
@@ -68,7 +95,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
         while let Some(c) = lock.as_mut().pop_front() {
             buf[i] = c;
             i += 1;
-            if c == 10 || i == buf.len() {
+            if c == 10 || i == buf.len() || !tty::icanon() {
                 break 'outer;
             }
         }

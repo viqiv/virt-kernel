@@ -374,6 +374,8 @@ pub fn readlinkat() -> u64 {
     let path = cstr_as_slice(tf.regs[1] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
+    let buf = as_slice_mut(tf.regs[2] as *mut u8, tf.regs[3] as usize);
+
     let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
         let mut cwd = task.cwd.as_ref().unwrap().clone();
         cwd.push_str(&path_str);
@@ -382,7 +384,99 @@ pub fn readlinkat() -> u64 {
         path_str
     };
 
-    !0
+    print!("READ LINK AT: {}\n", real_path);
+
+    if let Ok(n) = readlink(&real_path, buf) {
+        n as u64
+    } else {
+        -2i64 as u64
+    }
+}
+
+pub fn symlink(linkname: &str, path: &str) -> Result<(), ()> {
+    p9::symlink(linkname, path)
+}
+
+pub fn readlink(path: &str, buf: &mut [u8]) -> Result<usize, ()> {
+    if let Ok(str) = p9::readlink(path) {
+        let slice = str.as_bytes();
+        let n = min(buf.len(), slice.len());
+        buf[0..n].copy_from_slice(slice);
+        Ok(n)
+    } else {
+        Err(())
+    }
+}
+
+pub fn symlinkat() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let oldname = cstr_as_slice(tf.regs[0] as *const u8);
+    let oldname_str = String::from(str::from_utf8(oldname).unwrap());
+
+    let fd = tf.regs[1];
+
+    let path = cstr_as_slice(tf.regs[2] as *const u8);
+    let path_str = String::from(str::from_utf8(path).unwrap());
+
+    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
+        let mut cwd = task.cwd.as_ref().unwrap().clone();
+        cwd.push_str(&path_str);
+        cwd
+    } else {
+        path_str
+    };
+
+    print!("SYM LINK AT: old {} path {}\n", oldname_str, real_path);
+
+    if let Ok(_) = symlink(&oldname_str, &real_path) {
+        0
+    } else {
+        !0
+    }
+}
+
+pub fn rename(from: &str, to: &str) -> Result<(), ()> {
+    p9::rename(from, to)
+}
+
+pub fn renameat() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let oldfd = tf.regs[0];
+    let newfd = tf.regs[2];
+
+    let oldpath = cstr_as_slice(tf.regs[1] as *const u8);
+    let oldpath_str = String::from(str::from_utf8(oldpath).unwrap());
+
+    let newpath = cstr_as_slice(tf.regs[3] as *const u8);
+    let newpath_str = String::from(str::from_utf8(newpath).unwrap());
+
+    let real_oldpath = if oldfd == AT_FDCWD as u64 && !oldpath_str.starts_with("/") {
+        let mut cwd = task.cwd.as_ref().unwrap().clone();
+        cwd.push_str(&oldpath_str);
+        cwd
+    } else {
+        oldpath_str
+    };
+
+    let real_newpath = if newfd == AT_FDCWD as u64 && !newpath_str.starts_with("/") {
+        let mut cwd = task.cwd.as_ref().unwrap().clone();
+        cwd.push_str(&newpath_str);
+        cwd
+    } else {
+        newpath_str
+    };
+
+    print!("RENAMEAT: old {} new {}\n", real_oldpath, real_newpath);
+
+    if rename(&real_oldpath, &real_newpath).is_ok() {
+        0
+    } else {
+        -2i64 as u64
+    }
 }
 
 pub fn getrandom() -> u64 {
@@ -688,16 +782,18 @@ pub fn newfsstatat() -> u64 {
     print!("NEWFSTAT: {}\n", real_path);
 
     let stat = unsafe { (tf.regs[2] as *mut Stat).as_mut() }.unwrap();
-    match p9::stat(
+    if p9::stat(
         &real_path,
         stat,
-        tf.regs[3] as u32 & AT_SYMLINK_NOFOLLOW > 0,
-    ) {
-        Ok(_) => {
-            return 0;
-        }
-        _ => return !0,
+        tf.regs[3] as u32 & AT_SYMLINK_NOFOLLOW == 0,
+    )
+    .is_ok()
+    {
+        return 0;
     }
+
+    print!("NEWFSTAT FAIL: {}\n", real_path);
+    return -2i64 as u64;
 }
 
 pub fn newfstat() -> u64 {

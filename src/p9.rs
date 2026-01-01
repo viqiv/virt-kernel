@@ -149,7 +149,7 @@ impl Msg {
     }
 }
 
-const QSIZE: usize = 8;
+const QSIZE: usize = 32;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -164,6 +164,7 @@ pub enum QIDKind {
     SYMLINK = 0x02,
     LINK = 0x01,
     FILE = 0x00,
+    DONT = 0xff,
 }
 
 impl TryFrom<u8> for QIDKind {
@@ -410,6 +411,46 @@ impl Stat {
             len: 0,
         }
     }
+
+    // static int donttouch_stat(V9fsStat *stat)
+    // {
+    //     if (stat->type == -1 &&
+    //         stat->dev == -1 &&
+    //         stat->qid.type == 0xff &&
+    //         stat->qid.version == (uint32_t) -1 &&
+    //         stat->qid.path == (uint64_t) -1 &&
+    //         stat->mode == -1 &&
+    //         stat->atime == -1 &&
+    //         stat->mtime == -1 &&
+    //         stat->length == -1 &&
+    //         !stat->name.size &&
+    //         !stat->uid.size &&
+    //         !stat->gid.size &&
+    //         !stat->muid.size &&
+    //         stat->n_uid == -1 &&
+    //         stat->n_gid == -1 &&
+    //         stat->n_muid == -1) {
+    //         return 1;
+    //     }
+
+    //     return 0;
+    // }
+    //
+    const fn dont_touch() -> Stat {
+        Stat {
+            kind: !0,
+            dev: !0,
+            qid: QID {
+                kind: QIDKind::DONT,
+                version: !0,
+                path: !0,
+            },
+            mode: !0,
+            atime: !0,
+            mtime: !0,
+            len: !0,
+        }
+    }
 }
 
 mod ops {
@@ -418,9 +459,9 @@ mod ops {
     use alloc::{string::String, vec::Vec};
 
     use crate::{
-        p9::{Msg, Op, P9, P9L, QID, Stat, VERSION},
+        p9::{Msg, Op, P9, P9L, QID, QIDKind, Stat, VERSION},
         print,
-        sched::sleep,
+        sched::{mycpu, sleep},
         spin::LockGuard,
         stuff::defer,
         virtio::{self, get_irq_status, irq_ack},
@@ -949,19 +990,20 @@ mod ops {
             name, dir_fid, mode, perm
         );
 
-        // size[4] Tcreate tag[2] fid[4] name[s] perm[4] mode[4] gid [4]
+        // size[4] Tcreate tag[2] fid[4] name[s] perm[4] mode[1] xt s
         // size[4] Rcreate tag[2] qid[13] iounit[4]
-        let tlen = 4 + 1 + 2 + 4 + 2 + name.as_bytes().len() + 4 + 4 + 4;
+        let tlen = 4 + 1 + 2 + 4 + 2 + name.as_bytes().len() + 4 + 1 + 2;
         let rlen = 4 + 1 + 2 + 13 + 4;
         let mut msg = Msg::new(max(tlen, rlen));
         msg.write_u32(tlen as u32);
         msg.write_u8(Op::TCREATE as u8);
         msg.write_u16(p9.next_tag());
+
         msg.write_u32(dir_fid);
         msg.write_str(name);
-        msg.write_u32(perm);
-        msg.write_u32(mode as u32);
-        msg.write_u32(gid);
+        msg.write_u32(0o0777);
+        msg.write_u8(mode as u8);
+        msg.write_u16(0);
 
         let d1 = p9.q.alloc_desc().unwrap();
         let d2 = p9.q.alloc_desc().unwrap();
@@ -1005,13 +1047,34 @@ mod ops {
         Ok((dir_fid, qid, msg.read_u32().unwrap()))
     }
 
-    pub fn mkdir(fid: u32, name: &str, mode: u32, gid: u32) -> Result<QID, ()> {
+    pub fn mkdir(path: &str, mut mode: u32, gid: u32) -> Result<QID, ()> {
         let lock = P9L.acquire();
         let p9 = lock.as_mut();
+        let wnames = path_to_wnames(path);
 
-        if !p9.fid_is_ok(fid) {
+        if wnames.len() < 1 {
             return Err(());
         }
+
+        let dir_wnames = if wnames.len() > 1 {
+            &wnames[0..wnames.len() - 1]
+        } else {
+            &["."][0..]
+        };
+
+        print!("MKDIR WNAMES: {:?}\n", wnames);
+        print!("MKDIR DIRNAMES: {:?}\n", dir_wnames);
+
+        let (dir_fid, _) = walk_inner(&lock, dir_wnames).map_err(|_| ())?;
+
+        let def = defer(|| {
+            clunk_inner(&lock, dir_fid);
+        });
+
+        let name = wnames[wnames.len() - 1];
+        print!("MKDIR NAME: {:?} fid {:?}\n", name, dir_fid);
+
+        // mode = 0777;
 
         // size[4] Tcreate tag[2] fid[4] name[s] mode[4] gid [4]
         // size[4] Rcreate tag[2] qid[13] iounit[4]
@@ -1021,7 +1084,7 @@ mod ops {
         msg.write_u32(tlen as u32);
         msg.write_u8(Op::TMKDIR as u8);
         msg.write_u16(p9.next_tag());
-        msg.write_u32(fid);
+        msg.write_u32(dir_fid);
         msg.write_str(name);
         msg.write_u32(mode as u32);
         msg.write_u32(gid);
@@ -1135,8 +1198,8 @@ mod ops {
             return Err(());
         }
 
-        // size[4] Treaddir tag[2] fid[4]
-        // size[4] Rreaddir tag[2]
+        // size[4] Tstat tag[2] fid[4]
+        // size[4] Rstat tag[2]
         // [2] zero
         // [2] size
         // [2] type
@@ -1200,10 +1263,137 @@ mod ops {
         stat.qid.path = msg.read_u64().unwrap();
 
         stat.mode = msg.read_u32().unwrap();
+        stat.mode |= match stat.qid.kind {
+            QIDKind::DIR => 0x4000,
+            QIDKind::APPEND => todo!(),
+            QIDKind::EXCL => todo!(),
+            QIDKind::MOUNT => todo!(),
+            QIDKind::AUTH => todo!(),
+            QIDKind::TMP => todo!(),
+            QIDKind::DONT => todo!(),
+            QIDKind::SYMLINK => 0xA000,
+            QIDKind::LINK | QIDKind::FILE => 0x8000,
+        };
         stat.atime = msg.read_u32().unwrap();
         stat.mtime = msg.read_u32().unwrap();
         stat.len = msg.read_u64().unwrap();
         Ok(stat)
+    }
+
+    pub fn wstat(fid: u32, stat: &Stat) -> Result<(), ()> {
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+
+        if !p9.fid_is_ok(fid) {
+            return Err(());
+        }
+
+        // size[4] Tstat tag[2] fid[4]
+        //
+        // size[4]
+        // Rwstat
+        // tag[2]
+        // fid[4]
+        // [2] zero
+        //
+        // [2] size
+        // [2] type
+        // [4] dev
+        // [13] qid
+        // [4] mode
+        // [4] atime
+        // [4] mtime
+        // [8] length
+        // [s] name
+        // [s] uid
+        // [s] gid
+        // [s] muid
+        // [s] extension
+
+        let tlen =
+            4 + 1 + 2 + 4 + 2 + 2 + 2 + 4 + 13 + 4 + 4 + 4 + 8 + 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4;
+        let rlen = 4 + 1 + 2 + 4 + 13;
+
+        let mut msg = Msg::new(max(tlen, rlen));
+        // size[4]
+        msg.write_u32(tlen as u32);
+        // Rwstat
+        msg.write_u8(Op::TWSTAT as u8);
+        // tag[2]
+        msg.write_u16(p9.next_tag());
+        // fid[4]
+        msg.write_u32(fid);
+        // [2] zero
+        msg.write_u16(0);
+
+        // [2] size
+        msg.write_u16(tlen as u16 - 9);
+        // [2] type
+        msg.write_u16(stat.kind);
+        // [4] dev
+        msg.write_u32(stat.dev);
+        // [13] qid
+        msg.write_u8(stat.qid.kind as u8);
+        msg.write_u32(stat.qid.version);
+        msg.write_u64(stat.qid.path);
+        // [4] mode
+        msg.write_u32(stat.mode);
+        // [4] atime
+        msg.write_u32(stat.atime);
+        // [4] mtime
+        msg.write_u32(stat.mtime);
+        // [8] length
+        msg.write_u64(stat.len);
+        // [s] name
+        msg.write_u16(0);
+        // [s] uid
+        msg.write_u16(0);
+        // [s] gid
+        msg.write_u16(0);
+        // [s] muid
+        msg.write_u16(0);
+        // [s] extension
+        msg.write_u16(0);
+        // [4] uid
+        msg.write_u32(!0);
+        // [4] gid
+        msg.write_u32(!0);
+        // [4] muid
+        msg.write_u32(!0);
+
+        let d1 = p9.q.alloc_desc().unwrap();
+        let d2 = p9.q.alloc_desc().unwrap();
+
+        let desc1 = p9.q.get_desc_mut(d1 as usize);
+        desc1
+            .set_next(d2)
+            .set_data(msg.get_buf_ptr() as u64)
+            .set_len(tlen as u32);
+
+        let desc2 = p9.q.get_desc_mut(d2 as usize);
+
+        desc2
+            .set_writable()
+            .set_len(rlen as u32)
+            .set_data(msg.get_buf_ptr() as u64);
+
+        p9.q.set_desc_data(d1 as usize, msg.get_self_ptr());
+        let old = p9.q.add_avail(d1);
+
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
+        virtio::set_ready(regs, 0);
+        virtio::notify_q(regs, 0);
+        let _ = old;
+
+        sleep(msg.get_self_ptr(), lock.get_lock());
+
+        msg.seek(4);
+        let resp_kind = msg.read_u8().unwrap();
+        if resp_kind != Op::RWSTAT as u8 {
+            return Err(());
+        }
+
+        Ok(())
     }
 
     pub fn readlink(fid: u32) -> Result<String, ()> {
@@ -1359,8 +1549,8 @@ mod ops {
             &["."][0..]
         };
 
-        print!("SYMLINK WNAMES: {:?}\n", wnames);
-        print!("SYMLINK DIRNAMES: {:?}\n", dir_wnames);
+        print!("RENAME WNAMES: {:?}\n", wnames);
+        print!("RENAME DIRNAMES: {:?}\n", dir_wnames);
 
         let (dir_fid, _) = walk_inner(&lock, dir_wnames).map_err(|_| ())?;
 
@@ -1371,8 +1561,8 @@ mod ops {
         let name = wnames[wnames.len() - 1];
         print!("RENAME NAME: {:?} fid {:?}\n", name, dir_fid);
 
-        // size[4] Tsymlink tag[2] fid[4] dirfid [4] name s
-        // size[4] Rsymlink tag[2] qid[13]
+        // size[4] Trename tag[2] fid[4] dirfid [4] name s
+        // size[4] Rrename tag[2]
 
         let tlen = 4 + 1 + 2 + 4 + 4 + 2 + name.len();
         let rlen = 4 + 1 + 2;
@@ -1415,6 +1605,85 @@ mod ops {
 
         let resp_kind = msg.read_u8().unwrap();
         if resp_kind != Op::RRENAME as u8 {
+            return Err(());
+        }
+
+        Ok(())
+    }
+
+    pub fn link(fid: u32, path: &str) -> Result<(), ()> {
+        let lock = P9L.acquire();
+        let p9 = lock.as_mut();
+
+        let wnames = path_to_wnames(path);
+
+        if wnames.len() < 1 {
+            return Err(());
+        }
+
+        let dir_wnames = if wnames.len() > 1 {
+            &wnames[0..wnames.len() - 1]
+        } else {
+            &["."][0..]
+        };
+
+        print!("LINK WNAMES: {:?}\n", wnames);
+        print!("LINK DIRNAMES: {:?}\n", dir_wnames);
+
+        let (dir_fid, _) = walk_inner(&lock, dir_wnames).map_err(|_| ())?;
+
+        let def = defer(|| {
+            clunk_inner(&lock, dir_fid);
+        });
+
+        let name = wnames[wnames.len() - 1];
+        print!("LINK NAME: {:?} fid {:?}\n", name, dir_fid);
+
+        // size[4] Tlink tag[2] olddirfid[4] newdirfid [4] name s
+        // size[4] Rlink tag[2]
+
+        let tlen = 4 + 1 + 2 + 4 + 4 + 2 + name.len();
+        let rlen = 4 + 1 + 2 + 13;
+
+        let mut msg = Msg::new(max(tlen, rlen));
+
+        msg.write_u32(tlen as u32);
+        msg.write_u8(Op::TLINK as u8);
+        msg.write_u16(p9.next_tag());
+        msg.write_u32(dir_fid);
+        msg.write_u32(fid);
+        msg.write_str(name);
+
+        let d1 = p9.q.alloc_desc().unwrap();
+        let d2 = p9.q.alloc_desc().unwrap();
+
+        let desc1 = p9.q.get_desc_mut(d1 as usize);
+        desc1
+            .set_next(d2)
+            .set_data(msg.get_buf_ptr() as u64)
+            .set_len(tlen as u32);
+
+        let desc2 = p9.q.get_desc_mut(d2 as usize);
+
+        desc2
+            .set_writable()
+            .set_len(rlen as u32)
+            .set_data(msg.get_buf_ptr() as u64);
+
+        p9.q.set_desc_data(d1 as usize, msg.get_self_ptr());
+        let old = p9.q.add_avail(d1);
+
+        let regs = unsafe { p9.regs.unwrap().as_mut() };
+        virtio::set_ready(regs, 0);
+        virtio::notify_q(regs, 0);
+
+        sleep(msg.get_self_ptr(), lock.get_lock());
+
+        msg.seek(4);
+
+        let resp_kind = msg.read_u8().unwrap();
+        if resp_kind != Op::RLINK as u8 {
+            print!("RLINK FAIL: {}\n", resp_kind);
             return Err(());
         }
 
@@ -1480,6 +1749,7 @@ pub struct File {
     pub fid: u32,
     pub iou: u32,
     pub qid: QID,
+    st: Option<Stat>,
 }
 
 impl File {
@@ -1488,6 +1758,7 @@ impl File {
             fid: 0,
             iou: 0,
             qid: QID::new(),
+            st: None,
         }
     }
 }
@@ -1503,15 +1774,31 @@ impl File {
         ops::write(self.fid, &buf[0..len], offt)
     }
 
-    pub fn close(&self) -> Result<(), ()> {
+    pub fn close(&mut self) -> Result<(), ()> {
         print!("CLOSE CLUNK {}\n", self.fid);
         ops::clunk(self.fid).unwrap();
+        self.st = None;
         Ok(())
     }
 
+    pub fn get_size(&self) -> u64 {
+        if let Some(st) = &self.st { st.len } else { 0 }
+    }
+
     pub fn stat(&self, stat: &mut fs::Stat) -> Result<(), ()> {
-        if let Ok(s) = stat_inner(self.fid, stat) {
-            Ok(())
+        if let Some(s) = &self.st {
+            stat.st_dev = s.dev as u64;
+            stat.st_size = s.len as i64;
+            stat.st_atime = s.atime as i64;
+            stat.st_mtime = s.mtime as i64;
+            stat.st_mode = s.mode;
+            stat.st_uid = 1000;
+            stat.st_gid = 1000;
+            stat.st_nlink = if let QIDKind::DIR = s.qid.kind { 2 } else { 1 };
+            stat.st_blocks = align_f(s.len as usize, 4096) as i64 / 4096;
+            stat.st_blksize = 4096;
+            stat.st_ctime = 0;
+            return Ok(());
         } else {
             Err(())
         }
@@ -1565,6 +1852,45 @@ impl File {
     }
 }
 
+pub fn truncate(path: &str, size: u64) -> Result<(), ()> {
+    if let Ok((fid, qid)) = ops::walk(path) {
+        let mut s = Stat::dont_touch();
+        s.len = size;
+        let res = ops::wstat(fid, &s);
+        print!("FTRUNCATE: {} {:?}\n", path, res);
+        ops::clunk(fid).unwrap();
+        res
+    } else {
+        Err(())
+    }
+}
+
+pub fn link(from: &str, to: &str, follow: bool) -> Result<(), ()> {
+    if let Ok((fid, qid)) = ops::walk(from) {
+        let fid = if follow {
+            let real = follow_fid(fid, &qid).map_err(|_| ())?;
+            real
+        } else {
+            fid
+        };
+        print!("9p LINK: fid {}\n", fid);
+        let res = ops::link(fid, to);
+        print!("9p LINK: {} {} {:?}\n", from, to, res);
+        ops::clunk(fid).unwrap();
+        return res;
+    };
+
+    Err(())
+}
+
+pub fn mkdir(path: &str, mode: u32) -> Result<(), ()> {
+    if ops::mkdir(path, mode, 0).is_ok() {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 pub fn exists(path: &str) -> bool {
     if let Ok((fid, _)) = ops::walk(path) {
         ops::clunk(fid).unwrap();
@@ -1613,6 +1939,11 @@ pub fn open(path: &str, flags: u32) -> Result<&'static mut File, ()> {
                 file.fid = fid;
                 file.iou = iou;
                 file.qid = qid;
+                file.st = if let Ok(st) = ops::stat(fid) {
+                    Some(st)
+                } else {
+                    None
+                };
                 return Ok(file);
             } else {
                 print!("FAILED TO TCREATE: {}\n", path);
@@ -1629,6 +1960,11 @@ pub fn open(path: &str, flags: u32) -> Result<&'static mut File, ()> {
         file.fid = fid;
         file.iou = iou;
         file.qid = qid;
+        file.st = if let Ok(st) = ops::stat(fid) {
+            Some(st)
+        } else {
+            None
+        };
         Ok(file)
     } else {
         ops::clunk(fid).unwrap();
@@ -1639,16 +1975,6 @@ pub fn open(path: &str, flags: u32) -> Result<&'static mut File, ()> {
 
 pub fn stat_inner(fid: u32, stat: &mut fs::Stat) -> Result<(), ()> {
     if let Ok(mut s) = ops::stat(fid) {
-        s.mode |= match s.qid.kind {
-            QIDKind::DIR => 0x4000,
-            QIDKind::APPEND => todo!(),
-            QIDKind::EXCL => todo!(),
-            QIDKind::MOUNT => todo!(),
-            QIDKind::AUTH => todo!(),
-            QIDKind::TMP => todo!(),
-            QIDKind::SYMLINK => 0xA000,
-            QIDKind::LINK | QIDKind::FILE => 0x8000,
-        };
         stat.st_dev = s.dev as u64;
         stat.st_size = s.len as i64;
         stat.st_atime = s.atime as i64;
@@ -1703,21 +2029,6 @@ pub fn stat(path: &str, s: &mut fs::Stat, follow: bool) -> Result<(), ()> {
         } else {
             fid
         };
-        // let direct_fid = if let QIDKind::SYMLINK = qid.kind {
-        //     if !follow {
-        //         fid
-        //     } else {
-        //         let def = defer(|| ops::clunk(fid).unwrap());
-        //         let target = ops::readlink(fid).map_err(|_| ())?;
-        //         print!("READ link TARGET = {:?} follow: {}\n", target, follow);
-        //         let real_fid = follow_sym(fid).map_err(|_| ())?;
-        //         drop(def);
-        //         real_fid
-        //     }
-        // } else {
-        //     fid
-        // };
-
         print!("9p STAT: fid {}\n", fid);
         let res = stat_inner(fid, s);
         print!("9p STAT: {} {:?}\n", path, res);

@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 
-use crate::{cons, heap::SyncUnsafeCell, trap::gic_enable_intr, vm};
+use crate::{cons, heap::SyncUnsafeCell, ptr2ref, trap::gic_enable_intr, vm};
 
 static MAP: SyncUnsafeCell<usize> = SyncUnsafeCell(UnsafeCell::new(0));
 
@@ -61,6 +61,11 @@ pub fn enable_rx(map: usize) {
         let base = (map + 0x30) as *mut u32;
         let cr = base.read_volatile() | 1u32 << 9;
         base.write_volatile(cr);
+
+        let base = (map + 0x02C) as *mut u32;
+        let cr = base.read_volatile() | 1u32 << 4;
+        base.write_volatile(cr);
+
         let base = (map + 0x38) as *mut u32;
         let cr = base.read_volatile() | 1u32 << 4;
         base.write_volatile(cr);
@@ -89,10 +94,16 @@ fn read() -> u8 {
     unsafe { *dr }
 }
 
+#[inline]
+fn read_fl() -> u32 {
+    unsafe { ((MAP.0.get().read() + 0x18) as *const u32).read_volatile() }
+}
+
 pub fn handle_rx() {
-    let c = read();
-    // print!("uart... {}\n", c);
-    // print!("{:?}\n", frame);
-    cons::push_char(c);
+    while read_fl() & 0b10000 == 0 {
+        let c = read();
+        cons::push_char(c);
+        // print!("uart... {}\n", c);
+    }
     clr_rx();
 }

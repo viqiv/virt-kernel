@@ -142,9 +142,23 @@ macro_rules! ptr2mut {
 }
 
 #[macro_export]
+macro_rules! ptr2mut_op {
+    ($a:expr, $b:ty) => {
+        unsafe { ($a as *mut $b).as_mut() }
+    };
+}
+
+#[macro_export]
 macro_rules! ptr2ref {
     ($a:expr, $b:ty) => {
         unsafe { ($a as *mut $b).as_ref() }.unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! ptr2ref_op {
+    ($a:expr, $b:ty) => {
+        unsafe { ($a as *mut $b).as_ref() }
     };
 }
 

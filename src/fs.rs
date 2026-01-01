@@ -1,7 +1,9 @@
 use core::{
     cmp::min,
     ffi::{c_int, c_long, c_uint, c_ulong},
+    future::PollFn,
     marker::PhantomData,
+    str::ParseBoolError,
     sync::atomic::{AtomicU16, Ordering},
 };
 
@@ -10,10 +12,11 @@ use alloc::{str, string::String, vec::Vec};
 use crate::{
     cons::{self},
     heap::SyncUnsafeCell,
-    p9, print, ptr2mut,
-    sched::mycpu,
+    p9, print, ptr2mut, ptr2ref, ptr2ref_op, rtc,
+    sched::{Task, mycpu, sleep_if},
     spin::Lock,
     stuff::{as_slice, as_slice_mut, cstr_as_slice},
+    timer,
     tty::{self, Termios, Winsize},
 };
 
@@ -29,6 +32,13 @@ pub struct File {
     rc: AtomicU16,
     offt: u64,
     path: Option<String>,
+}
+
+pub struct Seek;
+impl Seek {
+    pub const SET: u64 = 0;
+    pub const CUR: u64 = 1;
+    pub const END: u64 = 2;
 }
 
 impl File {
@@ -92,7 +102,7 @@ impl File {
             Ordering::AcqRel, //
             Ordering::Relaxed,
         ) {
-            match &self.kind {
+            match &mut self.kind {
                 FileKind::P9(p9f) => {
                     return if let Ok(_) = p9f.close() {
                         print!(
@@ -129,6 +139,29 @@ impl File {
         } else {
             self.offt.wrapping_sub(offt as u64)
         };
+    }
+
+    pub fn get_size(&mut self) -> u64 {
+        match &self.kind {
+            FileKind::None => 0,
+            FileKind::Used => 0,
+            FileKind::P9(file) => file.get_size(),
+            FileKind::Cons(file) => file.get_size(),
+        }
+    }
+
+    pub fn lseek(&mut self, offt: i64, whence: u64) -> Result<u64, ()> {
+        match whence {
+            Seek::SET => self.seek_to(offt as usize),
+            Seek::END => {
+                let offt = self.get_size().wrapping_sub(offt as u64) as usize;
+                self.seek_to(offt)
+            }
+            Seek::CUR => self.seek_by(offt as i32),
+            _ => return Err(()),
+        };
+
+        Ok(self.offt)
     }
 
     pub fn dup(&mut self) -> Option<&'static mut Self> {
@@ -200,6 +233,45 @@ impl File {
         }
 
         Ok(n - rem)
+    }
+
+    pub fn readable(&self) -> bool {
+        match &self.kind {
+            FileKind::None => false,
+            FileKind::Used => false,
+            FileKind::P9(file) => true,
+            FileKind::Cons(file) => file.readable(),
+        }
+    }
+
+    pub fn writeable(&self) -> bool {
+        match self.kind {
+            FileKind::None => false,
+            FileKind::Used => false,
+            FileKind::P9(_) => true,
+            FileKind::Cons(_) => true,
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        match self.kind {
+            FileKind::None => false,
+            FileKind::Used => false,
+            FileKind::P9(_) => true,
+            FileKind::Cons(_) => true,
+        }
+    }
+
+    pub fn hanged_up(&self) -> bool {
+        false
+    }
+
+    pub fn wait4readable(&self) {
+        match &self.kind {
+            FileKind::P9(file) => {}
+            FileKind::Cons(file) => file.wait4readable(),
+            x => panic!("unhandled file kind."),
+        }
     }
 }
 
@@ -304,7 +376,47 @@ pub fn sys_writev() -> u64 {
             return !0;
         }
     }
+
     written
+}
+
+pub fn getcwd() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let cwd = task.cwd.as_ref().unwrap();
+    let len = min(tf.regs[1] as usize, cwd.as_bytes().len());
+    let buf = as_slice_mut(tf.regs[0] as *mut u8, len + 1);
+    print!("CWD = {}\n", cwd);
+    buf[0..cwd.as_bytes().len()].copy_from_slice(&cwd.as_bytes());
+    if tf.regs[1] as usize > cwd.len() {
+        buf[cwd.len()] = 0;
+    } else {
+        return -78i64 as u64;
+    }
+    0
+}
+
+pub fn chdir() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let path = cstr_as_slice(tf.regs[0] as *const u8);
+    let path_str = String::from(str::from_utf8(path).unwrap());
+
+    if exists(&path_str) {
+        task.cwd = Some(path_str);
+        0
+    } else {
+        -2i64 as u64
+    }
+}
+
+pub fn umask() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    let res = task.umask;
+    task.umask = tf.regs[0] as u32;
+    res as u64
 }
 
 pub fn getdents64() -> u64 {
@@ -376,12 +488,10 @@ pub fn readlinkat() -> u64 {
 
     let buf = as_slice_mut(tf.regs[2] as *mut u8, tf.regs[3] as usize);
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     print!("READ LINK AT: {}\n", real_path);
@@ -397,12 +507,20 @@ pub fn symlink(linkname: &str, path: &str) -> Result<(), ()> {
     p9::symlink(linkname, path)
 }
 
+fn cpystr(buf: &mut [u8], s: &str) -> usize {
+    let slice = s.as_bytes();
+    let n = min(buf.len(), slice.len());
+    buf[0..n].copy_from_slice(slice);
+    n
+}
+
 pub fn readlink(path: &str, buf: &mut [u8]) -> Result<usize, ()> {
+    if path == "/proc/self/fd/0" {
+        return Ok(cpystr(buf, "/dev/tty"));
+    }
+
     if let Ok(str) = p9::readlink(path) {
-        let slice = str.as_bytes();
-        let n = min(buf.len(), slice.len());
-        buf[0..n].copy_from_slice(slice);
-        Ok(n)
+        Ok(cpystr(buf, &str))
     } else {
         Err(())
     }
@@ -420,12 +538,10 @@ pub fn symlinkat() -> u64 {
     let path = cstr_as_slice(tf.regs[2] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     print!("SYM LINK AT: old {} path {}\n", oldname_str, real_path);
@@ -454,25 +570,65 @@ pub fn renameat() -> u64 {
     let newpath = cstr_as_slice(tf.regs[3] as *const u8);
     let newpath_str = String::from(str::from_utf8(newpath).unwrap());
 
-    let real_oldpath = if oldfd == AT_FDCWD as u64 && !oldpath_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&oldpath_str);
-        cwd
+    let real_oldpath = if let Ok(path) = at_path(oldfd, oldpath_str, task) {
+        path
     } else {
-        oldpath_str
+        return -2i64 as u64;
     };
 
-    let real_newpath = if newfd == AT_FDCWD as u64 && !newpath_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&newpath_str);
-        cwd
+    let real_newpath = if let Ok(path) = at_path(newfd, newpath_str, task) {
+        path
     } else {
-        newpath_str
+        return -2i64 as u64;
     };
 
     print!("RENAMEAT: old {} new {}\n", real_oldpath, real_newpath);
 
     if rename(&real_oldpath, &real_newpath).is_ok() {
+        0
+    } else {
+        -2i64 as u64
+    }
+}
+
+pub fn link(from: &str, to: &str, follow: bool) -> Result<(), ()> {
+    p9::link(from, to, follow)
+}
+
+pub fn linkat() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let oldfd = tf.regs[0];
+    let newfd = tf.regs[2];
+
+    let oldpath = cstr_as_slice(tf.regs[1] as *const u8);
+    let oldpath_str = String::from(str::from_utf8(oldpath).unwrap());
+
+    let newpath = cstr_as_slice(tf.regs[3] as *const u8);
+    let newpath_str = String::from(str::from_utf8(newpath).unwrap());
+
+    let real_oldpath = if let Ok(path) = at_path(oldfd, oldpath_str, task) {
+        path
+    } else {
+        return -2i64 as u64;
+    };
+
+    let real_newpath = if let Ok(path) = at_path(newfd, newpath_str, task) {
+        path
+    } else {
+        return -2i64 as u64;
+    };
+
+    print!("LINKAT: old {} new {}\n", real_oldpath, real_newpath);
+
+    if link(
+        &real_oldpath,
+        &real_newpath,
+        tf.regs[4] & SYMLINK_FOLLOW != 0,
+    )
+    .is_ok()
+    {
         0
     } else {
         -2i64 as u64
@@ -486,7 +642,26 @@ pub fn getrandom() -> u64 {
 }
 
 pub fn lseek() -> u64 {
-    !0
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let fd = tf.regs[0] as usize;
+    print!(
+        "LSEEK FD {} offt {} whence {}\n",
+        fd, tf.regs[1] as i64, tf.regs[2]
+    );
+
+    if task.files[fd].is_none() {
+        return -2i64 as u64;
+    }
+
+    let file = task.files[fd].as_mut().unwrap();
+
+    if let Ok(offt) = file.lseek(tf.regs[1] as i64, tf.regs[2]) {
+        offt
+    } else {
+        return -29i64 as u64;
+    }
 }
 
 pub struct T;
@@ -594,12 +769,10 @@ pub fn unlinkat() -> u64 {
     let path = cstr_as_slice(tf.regs[1] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     if let Ok(_) = remove(&real_path) {
@@ -607,6 +780,58 @@ pub fn unlinkat() -> u64 {
     } else {
         -2i64 as u64
     }
+}
+
+pub fn mkdir(path: &str, mode: u32) -> Result<(), ()> {
+    p9::mkdir(path, mode)
+}
+
+pub fn mkdirat() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let fd = tf.regs[0];
+
+    let path = cstr_as_slice(tf.regs[1] as *const u8);
+    let path_str = String::from(str::from_utf8(path).unwrap());
+
+    if let Ok(path) = at_path(fd, path_str, task) {
+        print!("MKDIRAT {}\n", path);
+        if mkdir(&path, tf.regs[2] as u32).is_ok() {
+            0
+        } else {
+            !0
+        }
+    } else {
+        -2i64 as u64
+    }
+}
+
+fn at_path(fd: u64, path: String, task: &Task) -> Result<String, ()> {
+    if path.starts_with("/") {
+        return Ok(path);
+    }
+
+    let mut dir_path = if fd == AT_FDCWD as u64 {
+        task.cwd.as_ref().unwrap().clone()
+    } else {
+        if let Some(dir) = task.get_file(fd as usize) {
+            if let Some(p) = &dir.path {
+                p.clone()
+            } else {
+                return Err(());
+            }
+        } else {
+            return Err(());
+        }
+    };
+
+    if !dir_path.ends_with("/") {
+        dir_path.push('/');
+    }
+
+    dir_path.push_str(&path);
+    Ok(dir_path)
 }
 
 pub fn utimensat() -> u64 {
@@ -618,12 +843,10 @@ pub fn utimensat() -> u64 {
     let path = cstr_as_slice(tf.regs[1] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     if exists(&real_path) { 0 } else { -2i64 as u64 }
@@ -639,15 +862,17 @@ pub fn openat() -> u64 {
 
     let fd = tf.regs[0];
 
+    if tf.regs[1] == 0 {
+        return !0;
+    }
+
     let path = cstr_as_slice(tf.regs[1] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     print!("OPEN: path {} by {}\n", real_path, task.pid);
@@ -676,8 +901,120 @@ pub fn fcntl() -> u64 {
     0
 }
 
+#[repr(C)]
+pub struct Pollfd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+pub struct POLL;
+impl POLL {
+    pub const IN: i16 = 0x001;
+    pub const PRI: i16 = 0x002;
+    pub const OUT: i16 = 0x004;
+    pub const ERR: i16 = 0x008;
+    pub const HUP: i16 = 0x010;
+    pub const NVAL: i16 = 0x020;
+    pub const RDNORM: i16 = 0x040;
+    pub const RDBAND: i16 = 0x080;
+}
+
+// done with int disabled
+fn check_events(pfds: &mut [Pollfd], task: &Task, timer_wait: bool) -> usize {
+    let mut n_events = 0;
+    for i in 0..pfds.len() {
+        let pfd = &mut pfds[i];
+        let events = pfd.events;
+        let fd = pfd.fd;
+        print!("CHECK EVENT fd: {} events: {}\n", fd, events);
+
+        pfd.revents = 0;
+
+        if let Some(file) = task.get_file(fd as usize) {
+            if !file.is_ok() {
+                pfd.revents |= POLL::ERR;
+            }
+
+            if file.hanged_up() {
+                pfd.revents |= POLL::HUP;
+            }
+        } else {
+            print!("POLL NO FILE: {}\n", fd);
+            pfd.revents |= POLL::NVAL;
+        }
+
+        if pfd.revents != 0 {
+            n_events += 1;
+            continue;
+        }
+
+        match events {
+            POLL::IN => {
+                if let Some(file) = task.get_file(fd as usize) {
+                    if file.readable() {
+                        print!("POLLIN DETECTED.\n");
+                        pfd.revents |= POLL::IN;
+                        n_events += 1;
+                    } else {
+                        print!("ADDING POLLIN TO WQ\n");
+                        file.wait4readable();
+                        if timer_wait {
+                            timer::add2wait();
+                        }
+                    }
+                }
+            }
+            x => panic!("unhandled poll: {}\n", x),
+        }
+    }
+    print!("CHECK EVENT RES = {}\n", n_events);
+    n_events
+}
+
 pub fn ppoll() -> u64 {
-    !0
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    if tf.regs[1] == 0 {
+        return 0;
+    }
+
+    let pfds = as_slice_mut(tf.regs[0] as *mut Pollfd, tf.regs[1] as usize);
+    let ts = ptr2ref_op!(tf.regs[2], rtc::KernelTimespec);
+
+    //TODO signal
+    print!("POLL tmeout = {:?}\n", ts);
+    let start = timer::read_tick();
+
+    let mut timed_out = false;
+    let mut n = 0;
+
+    while !timed_out {
+        n = 0;
+
+        sleep_if(&mut || {
+            n = check_events(pfds, task, ts.is_some());
+
+            if let Some(ts) = ts {
+                print!("WAITING FOR {}ms\n", ts.millis());
+                if timer::read_tick() - start > ts.millis() {
+                    timed_out = true
+                }
+            } else {
+                print!("WAITING FOR EVER\n");
+            }
+
+            n == 0 && !timed_out
+        });
+
+        if n > 0 {
+            break;
+        }
+    }
+
+    print!("POLL WAKE n: {} timed_out: {} ts: {:?}\n", n, timed_out, ts);
+    n as u64
 }
 
 pub fn close() -> u64 {
@@ -714,14 +1051,45 @@ pub fn dup3() -> u64 {
         return !0;
     }
 
-    if task.files[new_fd].is_some() {
-        task.files[new_fd].as_mut().unwrap().close().unwrap();
+    if old_fd == new_fd {
+        return old_fd as u64;
     }
 
-    let file = task.files[old_fd].as_mut().unwrap();
-    task.files[new_fd] = file.dup();
+    let mut replaced = task.get_file(new_fd);
+
+    let file = task.get_file(old_fd).unwrap();
+    task.files[new_fd] = Some(file.dup().unwrap());
+
+    if let Some(f) = &mut replaced {
+        f.close().unwrap();
+    }
+
+    print!("DUP3 {} to {}\n", old_fd, new_fd);
 
     new_fd as u64
+}
+
+pub fn ftruncate() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+
+    let fd = tf.regs[0] as usize;
+
+    if task.files[fd].is_none() {
+        return !0;
+    }
+
+    let file = task.get_file(fd).unwrap();
+
+    if file.path.is_none() {
+        return !0;
+    }
+
+    if truncate(file.path.as_ref().unwrap(), tf.regs[1]).is_ok() {
+        0
+    } else {
+        !0
+    }
 }
 
 pub fn sendfile64() -> u64 {
@@ -761,6 +1129,15 @@ pub fn sendfile64() -> u64 {
 }
 
 pub const AT_SYMLINK_NOFOLLOW: u32 = 256;
+pub const SYMLINK_FOLLOW: u64 = 0x400;
+
+pub fn fstat(path: &str, stat: &mut Stat, follow: bool) -> Result<(), ()> {
+    p9::stat(&path, stat, follow)
+}
+
+pub fn truncate(path: &str, size: u64) -> Result<(), ()> {
+    p9::truncate(path, size)
+}
 
 pub fn newfsstatat() -> u64 {
     let task = mycpu().get_task().unwrap();
@@ -771,18 +1148,16 @@ pub fn newfsstatat() -> u64 {
     let path = cstr_as_slice(tf.regs[1] as *const u8);
     let path_str = String::from(str::from_utf8(path).unwrap());
 
-    let real_path = if fd == AT_FDCWD as u64 && !path_str.starts_with("/") {
-        let mut cwd = task.cwd.as_ref().unwrap().clone();
-        cwd.push_str(&path_str);
-        cwd
+    let real_path = if let Ok(path) = at_path(fd, path_str, task) {
+        path
     } else {
-        path_str
+        return -2i64 as u64;
     };
 
     print!("NEWFSTAT: {}\n", real_path);
 
     let stat = unsafe { (tf.regs[2] as *mut Stat).as_mut() }.unwrap();
-    if p9::stat(
+    if fstat(
         &real_path,
         stat,
         tf.regs[3] as u32 & AT_SYMLINK_NOFOLLOW == 0,

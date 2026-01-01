@@ -1,7 +1,8 @@
 use crate::{
     heap::{self, SyncUnsafeCell},
+    ptr2mut, ptr2ref,
     sched::mycpu,
-    vm,
+    timer, vm,
 };
 
 struct U32ptr(*mut u32);
@@ -19,9 +20,16 @@ pub fn read() -> u32 {
 }
 
 #[repr(C)]
-struct KernelTimespec {
-    sec: i64,
-    nsec: i64,
+#[derive(Debug)]
+pub struct KernelTimespec {
+    pub sec: i64,
+    pub nsec: i64,
+}
+
+impl KernelTimespec {
+    pub fn millis(&self) -> u64 {
+        ((self.sec * 100) + (self.nsec / 1000_000_0)) as u64
+    }
 }
 
 struct Clock;
@@ -51,5 +59,21 @@ pub fn clock_gettime() -> u64 {
         },
         x => panic!("unimplemented clock: {}\n", x),
     }
+    0
+}
+
+pub fn clock_nanosleep() -> u64 {
+    let task = mycpu().get_task().unwrap();
+    let tf = task.get_trap_frame().unwrap();
+    //TODO
+    // match tf.regs[0] {
+    //     x => panic!("unimplemented clock: {}\n", x),
+    // }
+    let ts = ptr2ref!(tf.regs[2], KernelTimespec);
+
+    let millis = ts.millis();
+
+    timer::sleep(millis as u64);
+
     0
 }

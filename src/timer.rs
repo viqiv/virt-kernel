@@ -1,6 +1,12 @@
 use core::arch::asm;
 
-use crate::{print, sched, trap};
+use crate::{
+    heap::SyncUnsafeCell,
+    print,
+    sched::{self, Task, Wq, cpuid, mycpu, wakeup},
+    spin::Lock,
+    trap,
+};
 
 #[allow(unused)]
 #[inline]
@@ -71,10 +77,47 @@ pub fn init() {
     w_pctl_el0(1);
 }
 
-pub fn handle_tik() {
+pub fn handle_tik(el: u8) {
     let freq = r_freq();
-    // print!("tik... {:x}\n", freq);
+
+    // freq = ticks/s
+    // freq/100 = ticks/(s/100)
+
+    if cpuid() == 0 {
+        let lock = TICKLOCK.acquire();
+        // print!("T {} {} {}\n", lock.as_ref().0, lock.as_ref().1.count, el);
+        lock.as_mut().0 += 1;
+        // wakeup(lock.as_ref() as *const u64 as u64);
+        lock.as_mut().1.wake_all();
+        drop(lock);
+    }
+
     w_ptval_el0(freq / 100);
 
-    sched::yild();
+    if (el == 1 && mycpu().get_task().is_some()) || el == 0 {
+        sched::yild();
+    }
+}
+
+static TICKLOCK: Lock<(u64, Wq)> = Lock::new("TICK", (0, Wq::new("ticks")));
+
+pub fn sleep(millis: u64) {
+    let lock = TICKLOCK.acquire();
+    let mut start = lock.as_ref().0;
+
+    while (lock.as_ref().0 - start < millis) {
+        // sched::sleep(lock.as_ref() as *const u64 as u64, lock.get_lock());
+        lock.as_mut().1.sleep(lock.get_lock());
+    }
+}
+
+pub fn read_tick() -> u64 {
+    let lock = TICKLOCK.acquire();
+    lock.as_ref().0
+}
+
+pub fn add2wait() {
+    let lock = TICKLOCK.acquire();
+    let task = mycpu().get_task().unwrap();
+    lock.as_mut().1.add(task as *mut Task);
 }

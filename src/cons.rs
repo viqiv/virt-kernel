@@ -5,7 +5,7 @@ use crate::{
     fs,
     heap::SyncUnsafeCell,
     print,
-    sched::{sleep, wakeup},
+    sched::{Task, Wq, mycpu, sleep, wakeup},
     spin::Lock,
     tty,
     uart::{self, putc},
@@ -18,6 +18,17 @@ impl File {
         Ok(read_line(buf))
     }
 
+    pub fn readable(&self) -> bool {
+        let lock = BUF.acquire();
+        !lock.as_ref().buf.is_empty()
+    }
+
+    pub fn wait4readable(&self) {
+        let task = mycpu().get_task().unwrap();
+        let lock = BUF.acquire();
+        lock.as_mut().wq.add(task as *mut Task);
+    }
+
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, ()> {
         for &c in buf {
             if tty::opost() && tty::onlcr() && c == b'\n' {
@@ -26,6 +37,10 @@ impl File {
             putc(c);
         }
         Ok(buf.len())
+    }
+
+    pub fn get_size(&self) -> u64 {
+        0
     }
 
     pub fn stat(&self, stat: &mut fs::Stat) -> Result<(), ()> {
@@ -43,7 +58,18 @@ pub fn open() -> &'static mut File {
     FILE.as_mut()
 }
 
-static BUF: Lock<VecDeque<u8>> = Lock::new("cons buf", VecDeque::new());
+struct C {
+    buf: VecDeque<u8>,
+    wq: Wq,
+}
+
+static BUF: Lock<C> = Lock::new(
+    "cons buf",
+    C {
+        buf: VecDeque::new(),
+        wq: Wq::new("console"),
+    },
+);
 
 fn put_backspace() {
     putc(8);
@@ -54,31 +80,34 @@ fn put_backspace() {
 pub fn push_char(c: u8) {
     let lock = BUF.acquire();
     let buf = lock.as_mut();
+    print!("P: {} {}\n", c, buf.wq.count);
 
     if !tty::icanon() {
-        buf.push_back(c);
-        wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
+        buf.buf.push_back(c);
+        // wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
+        buf.wq.wake_all();
         return;
     }
 
     match c {
         127 => {
-            if buf.is_empty() {
+            if buf.buf.is_empty() {
                 return;
             }
             if tty::echo() {
                 put_backspace();
             }
-            buf.pop_back();
+            buf.buf.pop_back();
         }
         _ => {
             let c = if c == 13 { 10 } else { c };
             if tty::echo() {
                 putc(c);
             }
-            buf.push_back(c);
+            buf.buf.push_back(c);
             if c == 10 {
-                wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
+                // wakeup(&BUF as *const Lock<VecDeque<u8>> as u64);
+                buf.wq.wake_all();
             }
         }
     }
@@ -92,7 +121,7 @@ pub fn read_line(buf: &mut [u8]) -> usize {
     let mut i = 0;
 
     'outer: loop {
-        while let Some(c) = lock.as_mut().pop_front() {
+        while let Some(c) = lock.as_mut().buf.pop_front() {
             buf[i] = c;
             i += 1;
             if c == 10 || i == buf.len() || !tty::icanon() {
@@ -100,7 +129,8 @@ pub fn read_line(buf: &mut [u8]) -> usize {
             }
         }
 
-        sleep(&BUF as *const Lock<VecDeque<u8>> as u64, lock.get_lock());
+        // sleep(&BUF as *const Lock<VecDeque<u8>> as u64, lock.get_lock());
+        lock.as_mut().wq.sleep(lock.get_lock());
     }
 
     return i;

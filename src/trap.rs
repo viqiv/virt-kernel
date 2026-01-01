@@ -31,6 +31,10 @@ impl Frame {
             self.regs[i] = 0;
         }
     }
+
+    pub fn el(&self) -> u8 {
+        ((self.pstate >> 2) & 3) as u8
+    }
 }
 
 impl LowerHex for Frame {
@@ -54,7 +58,7 @@ pub extern "C" fn irq_handler(frame: &Frame) {
     let idx = gic_ack();
     gic_eoi(idx);
     match idx {
-        30 => timer::handle_tik(),
+        30 => timer::handle_tik(frame.el()),
         33 => uart::handle_rx(),
         78 => p9::irq_handle(),
         _ => {

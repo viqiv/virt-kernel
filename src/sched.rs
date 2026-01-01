@@ -71,7 +71,7 @@ static CPUS: SyncUnsafeCell<[Cpu; NCPU]> = SyncUnsafeCell::new([Cpu {
     shed_ctx: [0; 15],
 }]);
 
-fn cpuid() -> usize {
+pub fn cpuid() -> usize {
     0
 }
 
@@ -164,6 +164,7 @@ pub struct Task {
     mmap: Region,
     brk: Region,
     spel0: Region,
+    pub umask: u32,
     pub cwd: Option<String>,
 }
 
@@ -209,6 +210,7 @@ impl Task {
                 flags: elf::PF_R | elf::PF_W,
                 granule: 1,
             },
+            umask: 0777,
             cwd: None,
         }
     }
@@ -261,6 +263,60 @@ impl Task {
         self.ctx[13] = forkret as *const fn() as u64;
 
         self.trapframe = tf_ptr as u64;
+    }
+}
+
+pub struct Wq {
+    pub tasks: [Option<*mut Task>; NTASKS],
+    pub count: usize,
+    lock: Lock<()>,
+}
+
+impl Wq {
+    pub const fn new(name: &'static str) -> Wq {
+        Wq {
+            tasks: [None; NTASKS],
+            count: 0,
+            lock: Lock::new(name, ()),
+        }
+    }
+
+    pub fn add(&mut self, task: *mut Task) {
+        if task.is_null() {
+            return;
+        }
+        let lock = self.lock.acquire();
+        self.tasks[self.count] = Some(task);
+        self.count += 1;
+        drop(lock)
+    }
+
+    pub fn sleep<T>(&mut self, lock: &Lock<T>) {
+        let task = mycpu().get_task().unwrap();
+        self.add(task as *mut Task);
+        let task_lock = task.lock.acquire();
+        lock.release();
+        task.state = State::Sleeping;
+        task.chan = None;
+        sched();
+        forget(lock.acquire());
+        drop(task_lock);
+    }
+
+    pub fn wake_all(&mut self) {
+        let lock = self.lock.acquire();
+        for i in 0..self.count {
+            if let Some(task) = self.tasks[i] {
+                let task = ptr2mut!(task, Task);
+                let task_lock = task.lock.acquire();
+                if let State::Sleeping = task.state {
+                    task.state = State::Ready;
+                }
+                drop(task_lock);
+            }
+        }
+        self.count = 0;
+        drop(lock)
     }
 }
 
@@ -941,7 +997,16 @@ fn free_regions(regions: &mut RTree, l0_pt: &mut [u64], skip: bool) -> Result<()
 
 fn free_task(pid: usize) -> Result<(), vm::Error> {
     let task: &mut Task = &mut TASKS.as_mut()[pid];
-    print!("EXIT pid: {}\n", task.pid);
+
+    for i in 0..task.files.len() {
+        if let Some(f) = &mut task.files[i] {
+            print!("FREE FILE: {} dis: {}\n", i, mycpu().int_disables);
+            let c = f.close();
+            print!("FREE FILE: {} DONE dis: {}\n", i, mycpu().int_disables);
+            if c.is_err() {}
+        }
+    }
+
     let l0_pt = PmWrap::new(
         task.user_pt.unwrap() as usize, //
         vm::PR_PW,
@@ -957,18 +1022,28 @@ fn free_task(pid: usize) -> Result<(), vm::Error> {
 
     task.user_sp = None;
 
-    for i in 0..task.files.len() {
-        if let Some(f) = &mut task.files[i] {
-            let c = f.close();
-            if c.is_err() {}
-        }
-    }
-
     task.program.clear();
     task.brk.len = 0;
     task.mmap.len = 0;
 
     free_pt(task.user_pt.unwrap() as u64);
+
+    let wait_lock = WAIT.acquire();
+
+    //TODO reparent
+
+    if let Some(p) = task.parent {
+        wakeup(p as u64);
+        print!("TASK FREED pid: {}\n", task.pid);
+    }
+
+    let lock = task.lock.acquire();
+    task.state = State::Zombie;
+    task.exit_code = task.get_trap_frame().unwrap().regs[0];
+    forget(lock);
+
+    drop(wait_lock);
+
     Ok(())
 }
 
@@ -982,19 +1057,11 @@ pub fn exit() -> u64 {
             task.get_trap_frame().unwrap().regs[0]
         );
     }
-    let wait_lock = WAIT.acquire();
 
-    if let Some(p) = task.parent {
-        wakeup(p as u64);
-    }
-
-    let lock = task.lock.acquire();
-    task.exit_code = task.get_trap_frame().unwrap().regs[0];
     free_task(task.pid as usize).unwrap();
-    task.state = State::Zombie;
-    drop(wait_lock);
+
+    print!("EXIT pid: {}\n", task.pid);
     sched();
-    let _ = lock;
     0
 }
 
@@ -1003,6 +1070,10 @@ pub fn exit_group() -> u64 {
 }
 
 pub fn getuid() -> u64 {
+    0
+}
+
+pub fn geteuid() -> u64 {
     0
 }
 
@@ -1033,7 +1104,7 @@ pub fn uname() -> u64 {
     let tf = t.get_trap_frame().unwrap();
     let ptr = unsafe { (tf.regs[0] as *mut OldUtsname).as_mut() }.unwrap();
 
-    (&mut ptr.name[0..7]).copy_from_slice("hoenix\0".as_bytes());
+    (&mut ptr.name[0..2]).copy_from_slice("?\0".as_bytes());
     (&mut ptr.name[7..7 + 6]).copy_from_slice("local\0".as_bytes());
     (&mut ptr.name[7 + 6..7 + 6 + 6]).copy_from_slice("0.0.1\0".as_bytes());
     (&mut ptr.name[7 + 6 + 6..7 + 6 + 6 + 2]).copy_from_slice("0\0".as_bytes());
@@ -1090,8 +1161,6 @@ fn copy_pm(from_pm: usize, to_pm: usize, n: usize) -> Result<(), ()> {
     Ok(())
 }
 
-static COW: Lock<()> = Lock::new("cow", ());
-
 pub fn find_region(task: &mut Task, v: usize) -> Option<Region> {
     if task.brk.has(v) {
         return Some(task.brk);
@@ -1108,7 +1177,6 @@ pub fn find_region(task: &mut Task, v: usize) -> Option<Region> {
 pub fn dabt_handler() {
     let task = mycpu().get_task().unwrap();
     let vaddr = r_far_el1() as usize;
-    let lock = COW.acquire();
 
     if let Some(region) = find_region(task, vaddr) {
         if region.flags & elf::PF_W > 0 {
@@ -1166,7 +1234,6 @@ pub fn dabt_handler() {
         }
     }
 
-    _ = lock;
     //TODO segfaultonomy
     let tf = task.get_trap_frame().unwrap();
     let tls = r_tpidr_el0();
@@ -1188,6 +1255,19 @@ pub fn sleep<T>(chan: u64, lock: &Lock<T>) {
     let old = lock.acquire();
     let _ = task_lock;
     forget(old);
+}
+
+pub fn sleep_if<F: FnMut() -> bool>(cond: &mut F) {
+    let task = mycpu().get_task().unwrap();
+    let task_lock = task.lock.acquire();
+    if !cond() {
+        return;
+    }
+    task.state = State::Sleeping;
+    task.chan = None;
+    sched();
+    task.chan = None;
+    drop(task_lock);
 }
 
 pub fn wakeup(chan: u64) {
@@ -1252,12 +1332,12 @@ pub fn sched() {
 }
 
 pub fn yild() {
-    if let Some(task) = mycpu().get_task() {
-        let lock = task.lock.acquire(); // re-acquire one released at fork ret
-        task.state = State::Ready;
-        sched();
-        let _ = lock;
-    }
+    let task = mycpu().get_task().unwrap();
+    let lock = task.lock.acquire(); // re-acquire one released at fork ret
+    task.state = State::Ready;
+    sched();
+    print!("RESUME {}\n", task.pid);
+    drop(lock);
 }
 
 pub fn getpid() -> u64 {
@@ -1279,21 +1359,6 @@ pub fn kill() -> u64 {
 
 pub fn tgkill() -> u64 {
     0
-}
-
-pub fn getcwd() -> u64 {
-    let task = mycpu().get_task().unwrap();
-    let tf = task.get_trap_frame().unwrap();
-    let cwd = task.cwd.as_ref().unwrap();
-    let len = min(tf.regs[1] as usize, cwd.as_bytes().len());
-    let buf = as_slice_mut(tf.regs[0] as *mut u8, len + 1);
-    buf[0..cwd.as_bytes().len()].copy_from_slice(&cwd.as_bytes());
-    if tf.regs[1] as usize > cwd.len() {
-        buf[cwd.len()] = 0;
-    } else {
-        return 0;
-    }
-    tf.regs[0]
 }
 
 pub fn getpgid() -> u64 {
@@ -1338,7 +1403,6 @@ pub fn create_task(entry: u64) {
     task.files[1] = Some(fs::open_cons().unwrap());
     task.files[2] = Some(fs::open_cons().unwrap());
     task.state = State::Ready;
-
     task.lock.release();
 }
 
@@ -1356,7 +1420,7 @@ const TEST_ENV: [&[u8]; 4] = [
     "PATH=/bin".as_bytes(),
     "PWD=/".as_bytes(),
     "LC_ALL=C".as_bytes(),
-    "PS1=hoenix $ ".as_bytes(),
+    "PS1=\\w \\$ ".as_bytes(),
 ];
 
 #[unsafe(no_mangle)]
@@ -1375,6 +1439,7 @@ pub extern "C" fn forkret() {
             "busybox",
             &[
                 "sh".as_bytes(),
+                "-i".as_bytes(),
                 // "sh".as_bytes(),
                 // "-a".as_bytes(),
                 // "bar".as_bytes(),

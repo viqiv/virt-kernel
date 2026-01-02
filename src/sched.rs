@@ -1039,7 +1039,6 @@ fn free_task(pid: usize) -> Result<(), vm::Error> {
 
     let lock = task.lock.acquire();
     task.state = State::Zombie;
-    task.exit_code = task.get_trap_frame().unwrap().regs[0];
     forget(lock);
 
     drop(wait_lock);
@@ -1051,6 +1050,8 @@ static WAIT: Lock<()> = Lock::new("wait", ());
 
 pub fn exit() -> u64 {
     let task = mycpu().get_task().unwrap();
+    task.exit_code = task.get_trap_frame().unwrap().regs[0];
+
     if task.pid == 0 {
         panic!(
             "pid 0 tried to exit {}\n",
@@ -1060,7 +1061,7 @@ pub fn exit() -> u64 {
 
     free_task(task.pid as usize).unwrap();
 
-    print!("EXIT pid: {}\n", task.pid);
+    print!("EXIT pid: {} status {}\n", task.pid, task.exit_code);
     sched();
     0
 }

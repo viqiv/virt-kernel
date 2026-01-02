@@ -574,9 +574,17 @@ mod ops {
 
         // size[4] Twalk tag[2] fid[4] newfid[4] nwname[2] nwname*(wname[s])
         // size[4] Rwalk tag[2] nwqid[2] nwqid*(wqid[13])
-        let resp_len = 22 + 13 * wnames.len();
-        let mut msg = Msg::new(resp_len);
-        msg.write_u32(0);
+
+        let mut strlens = 0;
+        for i in 0..wnames.len() {
+            strlens += (2 + wnames[i].len());
+        }
+
+        let tlen = 4 + 1 + 2 + 4 + 4 + 2 + strlens;
+        let rlen = 4 + 1 + 2 + 2 + (13 * wnames.len());
+
+        let mut msg = Msg::new(max(tlen, rlen));
+        msg.write_u32(tlen as u32);
         msg.write_u8(Op::TWALK as u8);
         msg.write_u16(p9.next_tag());
         msg.write_u32(0);
@@ -584,12 +592,10 @@ mod ops {
         let def = defer(|| lock.as_mut().free_fid(fid));
         msg.write_u32(fid);
         msg.write_u16(wnames.len() as u16);
+
         for i in 0..wnames.len() {
             msg.write_str(wnames[i]);
         }
-        let len = msg.tell();
-        msg.seek(0);
-        msg.write_u32(len as u32);
 
         let d1 = p9.q.alloc_desc().unwrap();
         let d2 = p9.q.alloc_desc().unwrap();
@@ -598,13 +604,13 @@ mod ops {
         desc1
             .set_next(d2)
             .set_data(msg.get_buf_ptr() as u64)
-            .set_len(len as u32);
+            .set_len(tlen as u32);
 
         let desc2 = p9.q.get_desc_mut(d2 as usize);
 
         desc2
             .set_writable()
-            .set_len(resp_len as u32)
+            .set_len(rlen as u32)
             .set_data(msg.get_buf_ptr() as u64);
 
         p9.q.set_desc_data(d1 as usize, msg.get_self_ptr());
